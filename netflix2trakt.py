@@ -279,7 +279,12 @@ def addShowToTrakt(show, traktIO):
                         "watched_at": watchedTime,
                         "ids": {"tmdb": episode.tmdbId},
                     }
-                    traktIO.addEpisodeToHistory(episodeData)
+                    try:
+                        traktIO.addEpisodeToHistory(episodeData)
+                    except Exception as e:
+                        logging.warning(f"Failed to add episode {episode.tmdbId} to Trakt: {e}")
+                        continue
+
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_random(min=2, max=10))
