@@ -137,9 +137,14 @@ class TraktIO(object):
                 watched_shows = Trakt["sync/watched"].shows()
                 if watched_shows:
                     for show in watched_shows:
+                        show_name = show.title.lower() if hasattr(show, 'title') else ""
                         for season in show.seasons:
                             for episode in season.episodes:
+                                # Cache episodes by both trakt ID and show/season/episode info
                                 self._watched_episodes.add(episode.trakt)
+                                # Also cache by show name, season, episode for lookup
+                                episode_key = (show_name, season.number, episode.number)
+                                self._watched_episodes.add(episode_key)
                 
                 # Cache watched movies
                 watched_movies = Trakt["sync/watched"].movies()
@@ -159,9 +164,10 @@ class TraktIO(object):
     
     def isEpisodeWatched(self, show_name: str, season_number: int, episode_number: int) -> bool:
         """Your addition - Check if episode was already watched"""
-        # This would need to be implemented based on the cached data structure
-        # For now, returning False to maintain functionality
-        return False
+        episode_key = (show_name.lower(), season_number, episode_number)
+        result = episode_key in self._watched_episodes
+        logging.debug(f"isEpisodeWatched({show_name}, S{season_number:02d}E{episode_number:02d}) -> {result}")
+        return result
     
     def addMovie(self, movie_data: dict):
         """Your addition - Add movie to batch list"""

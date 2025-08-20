@@ -113,9 +113,11 @@ def dump_uncategorized_titles(submitted_titles, response, label="sync"):
 
 @retry(stop=stop_after_attempt(5), wait=wait_random(min=2, max=10))
 def getShowInformation(
-    show, languageSearch, traktIO, tmdb_cache: TMDBHelper, tmdbTv=TV()
+    show, languageSearch, traktIO, tmdb_cache: TMDBHelper, tmdbTv=None
 ):
     # Fetches show and episode information from TMDB, adds to Trakt
+    if tmdbTv is None:
+        tmdbTv = TV()
     tmdbSeason = Season()
     tmdbShow = None
 
@@ -156,7 +158,30 @@ def getShowInformation(
 
         if tmdbResult and hasattr(tmdbResult, "episodes"):
             for episode in season.episodes:
-                pass
+                # Match episode by episode number
+                tmdb_episodes = getattr(tmdbResult, "episodes", [])
+                for tmdbEpisode in tmdb_episodes:
+                    if tmdbEpisode.get("episode_number") == episode.episode_number:
+                        episode.tmdbId = tmdbEpisode.get("id")
+                        logging.debug(
+                            f"Matched episode {show.name} S{season.number}E{episode.episode_number} with TMDB ID {episode.tmdbId}"
+                        )
+                        break
+                
+                # If not found by episode number, try by name if available
+                if not episode.tmdbId and hasattr(episode, 'name') and episode.name:
+                    for tmdbEpisode in tmdb_episodes:
+                        if tmdbEpisode.get("name", "").lower() == episode.name.lower():
+                            episode.tmdbId = tmdbEpisode.get("id")
+                            logging.debug(
+                                f"Matched episode {show.name} S{season.number}E{episode.episode_number} by name with TMDB ID {episode.tmdbId}"
+                            )
+                            break
+                
+                if not episode.tmdbId:
+                    logging.warning(
+                        f"Could not find TMDB match for episode {show.name} S{season.number}E{episode.episode_number}"
+                    )
         else:
             logging.warning(
                 f"Could not retrieve episodes for {show.name} season {season.number}"
@@ -280,6 +305,7 @@ def main():
 
     logging.basicConfig(filename=config.LOG_FILENAME, level=config.LOG_LEVEL)
 
+    # Configure TMDB
     setupTMDB(config.TMDB_API_KEY, config.TMDB_LANGUAGE, config.TMDB_DEBUG)
     tmdb_cache = TMDBHelper()
 
