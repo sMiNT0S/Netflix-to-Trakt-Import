@@ -18,16 +18,20 @@ class TraktIO(object):
     def __init__(self, page_size=50, dry_run=False):
         # Configure Trakt client credentials
         Trakt.configuration.defaults.client(
-            id=config.TRAKT_API_CLIENT_ID, 
+            id=config.TRAKT_API_CLIENT_ID,
             secret=config.TRAKT_API_CLIENT_SECRET
         )
-        
+
         self.authorization = None
-        self._watched_episodes = set()  # Your addition - caching
-        self._watched_movies = set()    # Your addition - caching
-        self._episodes = []             # Your addition - batch collection
-        self._movies = []               # Your addition - batch collection
-        self.dry_run = dry_run         # Your addition - dry run mode
+        # Caches / buffers:
+        # _watched_episodes: stores trakt episode IDs and (show, season, episode) tuples
+        # _watched_movies: stores movie TMDB IDs
+        # _episodes / _movies: pending history payloads for next sync batch
+        self._watched_episodes = set()
+        self._watched_movies = set()
+        self._episodes = []
+        self._movies = []
+        self.dry_run = dry_run
         self.is_authenticating = Condition()
         self.page_size = page_size
         
@@ -44,12 +48,12 @@ class TraktIO(object):
             with open("traktAuth.json") as infile:
                 self.authorization = json.load(infile)
             
-            # Your addition - manual token refresh
+            
             if not self.checkAuthenticationValid():
                 print("Authorization is expired, attempting manual refresh...")
                 self._refresh_token()
             
-            # Your addition - cache watched history
+            
             if self.getWatchedShows() is not None:
                 print("Authorization appears valid. Watched shows retrieved.")
                 self.cacheWatchedHistory()
@@ -57,20 +61,24 @@ class TraktIO(object):
                 print("No watched shows found. Token may still be invalid or no data available.")
     
     def _refresh_token(self):
-        """Your addition - Refresh expired Trakt token manually"""
+        """Manually refresh expired Trakt token (fallback if library hasn't refreshed)."""
         if not self.authorization:
             print("Cannot refresh token, no authorization found.")
             return
         
+        payload = {
+            "refresh_token": self.authorization.get("refresh_token"),
+            "client_id": config.TRAKT_API_CLIENT_ID,
+            "client_secret": config.TRAKT_API_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+        }
+        if getattr(config, "TRAKT_REDIRECT_URI", None):  # include only if configured
+            payload["redirect_uri"] = config.TRAKT_REDIRECT_URI
+
         response = requests.post(
             "https://api.trakt.tv/oauth/token",
-            json={
-                "refresh_token": self.authorization.get("refresh_token"),
-                "client_id": config.TRAKT_API_CLIENT_ID,
-                "client_secret": config.TRAKT_API_CLIENT_SECRET,
-                "redirect_uri": config.TRAKT_REDIRECT_URI,
-                "grant_type": "refresh_token",
-            },
+            json=payload,
+            timeout=30,
         )
         
         if response.status_code == 200:
@@ -124,7 +132,7 @@ class TraktIO(object):
             return None
     
     def cacheWatchedHistory(self):
-        """Your addition - Cache watched episodes and movies to avoid resubmitting"""
+        """Populate watched caches so we don't resubmit already recorded history."""
         if self.dry_run:
             logging.info("Dry run enabled. Skipping watched history caching from Trakt.")
             return
@@ -157,28 +165,28 @@ class TraktIO(object):
             logging.error(f"⚠ Error caching Trakt history: {e}")
     
     def isWatchedMovie(self, tmdb_id: int) -> bool:
-        """Your addition - Check if movie was already watched"""
+        """Return True if the TMDB movie ID is already in watched cache."""
         result = tmdb_id in self._watched_movies
         logging.debug(f"isWatchedMovie({tmdb_id}) -> {result}")
         return result
     
     def isEpisodeWatched(self, show_name: str, season_number: int, episode_number: int) -> bool:
-        """Your addition - Check if episode was already watched"""
+        """Return True if (show, season, episode) tuple is cached as watched."""
         episode_key = (show_name.lower(), season_number, episode_number)
         result = episode_key in self._watched_episodes
         logging.debug(f"isEpisodeWatched({show_name}, S{season_number:02d}E{episode_number:02d}) -> {result}")
         return result
     
     def addMovie(self, movie_data: dict):
-        """Your addition - Add movie to batch list"""
+        """Queue a movie payload for next sync."""
         self._movies.append(movie_data)
     
     def addEpisodeToHistory(self, episode_data: dict):
-        """Your addition - Add episode to batch list"""
+        """Queue an episode payload for next sync."""
         self._episodes.append(episode_data)
     
     def getData(self) -> dict:
-        """Your addition - Get locally stored movie and episode data for sync"""
+        """Return queued movie and episode payloads for sync."""
         return {"movies": self._movies, "episodes": self._episodes}
     
     def sync(self):
@@ -228,9 +236,10 @@ class TraktIO(object):
         payload = json.dumps(self.getData())
         
         response = requests.post(
-            "https://api.trakt.tv/sync/history", 
-            headers=headers, 
-            data=payload
+            "https://api.trakt.tv/sync/history",
+            headers=headers,
+            data=payload,
+            timeout=30,
         )
         
         if response.status_code != 201:
@@ -241,7 +250,7 @@ class TraktIO(object):
         json_response = response.json()
         logging.debug("Trakt sync response: %s", json.dumps(json_response, indent=2))
         
-        # Your addition - sanitize response
+        # Sanitize response lists (handle APIs that return counts instead of arrays)
         for key in ["added", "updated", "not_found"]:
             for subkey in ["movies", "episodes", "shows"]:
                 if key in json_response and subkey in json_response[key]:
@@ -252,7 +261,7 @@ class TraktIO(object):
         return json_response
     
     def _get_auth_headers(self):
-        """Your addition - Return authorization headers for direct API calls"""
+        """Return authorization headers for direct API calls."""
         if not self.authorization:
             raise Exception("User is not authenticated.")
         
