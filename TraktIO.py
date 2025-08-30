@@ -4,7 +4,7 @@ import json
 import logging
 import os.path
 from threading import Condition
-import requests
+import time
 from trakt import Trakt
 import config
 
@@ -13,7 +13,16 @@ logging.basicConfig(level=config.LOG_LEVEL)
 
 
 class TraktIO(object):
-    """Handles Trakt authorization, caching, and sync logic"""
+    """
+    Handles Trakt authorization, caching, and sync logic.
+    
+    Features:
+    - OAuth device code authentication flow
+    - Automatic token refresh via trakt.py library
+    - Caching of watched content to prevent duplicates
+    - Batch syncing with configurable page size
+    - Dry run mode for testing
+    """
     
     def __init__(self, page_size=50, dry_run=False):
         # Configure Trakt client credentials
@@ -23,20 +32,27 @@ class TraktIO(object):
         )
 
         self.authorization = None
-        # Caches / buffers:
-        # _watched_episodes: stores trakt episode IDs and (show, season, episode) tuples
-        # _watched_movies: stores movie TMDB IDs
-        # _episodes / _movies: pending history payloads for next sync batch
+        
+        # Caches for preventing duplicate submissions:
+        # - _watched_episodes: stores both trakt IDs and (show, season, episode) tuples
+        # - _watched_movies: stores TMDB IDs of watched movies
         self._watched_episodes = set()
         self._watched_movies = set()
+        
+        # Buffers for batch syncing:
+        # - _episodes: episode history entries pending sync
+        # - _movies: movie history entries pending sync
         self._episodes = []
         self._movies = []
+        
         self.dry_run = dry_run
         self.is_authenticating = Condition()
         self.page_size = page_size
         
         # Skip authentication in dry run mode
         if not self.dry_run:
+            # Register token refresh handler to persist updated tokens
+            Trakt.on("oauth.token_refreshed", self._on_token_refreshed)
             self._initialize_auth()
     
     def _initialize_auth(self):
@@ -48,11 +64,11 @@ class TraktIO(object):
             with open("traktAuth.json") as infile:
                 self.authorization = json.load(infile)
             
-            
-            if not self.checkAuthenticationValid():
-                print("Authorization is expired, attempting manual refresh...")
-                self._refresh_token()
-            
+            # Set the token in trakt.py for automatic refresh
+            if self.authorization:
+                with Trakt.configuration.oauth.from_response(self.authorization):
+                    # This context manager sets up the token for the library
+                    pass
             
             if self.getWatchedShows() is not None:
                 print("Authorization appears valid. Watched shows retrieved.")
@@ -60,79 +76,97 @@ class TraktIO(object):
             else:
                 print("No watched shows found. Token may still be invalid or no data available.")
     
-    def _refresh_token(self):
-        """Manually refresh expired Trakt token (fallback if library hasn't refreshed)."""
-        if not self.authorization:
-            print("Cannot refresh token, no authorization found.")
-            return
-        
-        payload = {
-            "refresh_token": self.authorization.get("refresh_token"),
-            "client_id": config.TRAKT_API_CLIENT_ID,
-            "client_secret": config.TRAKT_API_CLIENT_SECRET,
-            "grant_type": "refresh_token",
-        }
-        if getattr(config, "TRAKT_REDIRECT_URI", None):  # include only if configured
-            payload["redirect_uri"] = config.TRAKT_REDIRECT_URI
-
-        response = requests.post(
-            "https://api.trakt.tv/oauth/token",
-            json=payload,
-            timeout=30,
-        )
-        
-        if response.status_code == 200:
-            self.authorization = response.json()
-            with open("traktAuth.json", "w") as outfile:
-                json.dump(self.authorization, outfile)
-            print("Token successfully refreshed manually.")
-            # Update Trakt library with new token
-            Trakt.configuration.defaults.oauth.from_response(self.authorization)
-        else:
-            print("Manual token refresh failed: %s" % response.text)
+    def _on_token_refreshed(self, authorization):
+        """
+        Event callback from trakt.py when token auto-refreshes.
+        Persists the refreshed token to disk.
+        """
+        self.authorization = authorization
+        try:
+            with open("traktAuth.json", "w") as f:
+                json.dump(self.authorization, f)
+            logging.debug("Persisted refreshed Trakt token.")
+        except Exception as e:
+            logging.warning(f"Failed to persist refreshed token: {e}")
     
     def checkAuthenticationValid(self) -> bool:
-        """Check if token is still valid"""
+        """Check if token exists and has required fields"""
         if not self.authorization:
             return False
-        return "access_token" in self.authorization
+        
+        # Check for essential OAuth fields
+        has_token = "access_token" in self.authorization
+        
+        # Log token info for debugging (without exposing sensitive data)
+        if has_token:
+            created_at = self.authorization.get("created_at", "unknown")
+            expires_in = self.authorization.get("expires_in", "unknown")
+            logging.debug(f"Token created_at: {created_at}, expires_in: {expires_in}")
+        
+        return has_token
     
     def getWatchedShows(self):
         """Fetch watched shows list from Trakt using the library"""
         try:
             with Trakt.configuration.oauth.from_response(self.authorization):
                 watched = Trakt["sync/watched"].shows()
-                if watched:
-                    # Convert to JSON format for compatibility
-                    json_response = []
-                    for show in watched:
-                        show_dict = {
-                            "show": {"title": show.title, "ids": {"trakt": show.trakt}},
-                            "seasons": []
-                        }
-                        for season in show.seasons:
-                            season_dict = {
-                                "number": season.number,
-                                "episodes": [
-                                    {"number": ep.number, "ids": {"trakt": ep.trakt}}
-                                    for ep in season.episodes
-                                ]
-                            }
-                            show_dict["seasons"].append(season_dict)
-                        json_response.append(show_dict)
+                if not watched:
+                    return None
+                
+                # Convert generator to list to check if empty
+                watched_list = list(watched)
+                if not watched_list:
+                    return None
+                
+                # Convert to JSON-compatible format for compatibility
+                json_response = []
+                for entry in watched_list:
+                    # Handle different return formats from trakt.py
+                    # The library returns (show, seasons) tuples
+                    if isinstance(entry, tuple) and len(entry) == 2:
+                        show, seasons = entry
+                    else:
+                        show = entry
+                        seasons = getattr(entry, 'seasons', [])
                     
-                    logging.debug(
-                        "Trakt watched shows response: %s",
-                        json.dumps(json_response, indent=2),
-                    )
-                    return json_response
-            return None
+                    # Build normalized structure
+                    show_dict = {
+                        "show": {
+                            "title": getattr(show, 'title', 'Unknown'),
+                            "ids": {"trakt": getattr(show, 'trakt', None)}
+                        },
+                        "seasons": []
+                    }
+                    
+                    for season in seasons:
+                        season_dict = {
+                            "number": getattr(season, 'number', 0),
+                            "episodes": []
+                        }
+                        
+                        episodes = getattr(season, 'episodes', [])
+                        for ep in episodes:
+                            season_dict["episodes"].append({
+                                "number": getattr(ep, 'number', 0),
+                                "ids": {"trakt": getattr(ep, 'trakt', None)}
+                            })
+                        
+                        show_dict["seasons"].append(season_dict)
+                    
+                    json_response.append(show_dict)
+                
+                logging.debug(
+                    "Trakt watched shows response: %d shows",
+                    len(json_response)
+                )
+                return json_response
+                
         except Exception as e:
-            print(f"❌ Failed to fetch watched shows: {e}")
+            logging.error(f"Failed to fetch watched shows: {e}")
             return None
     
     def cacheWatchedHistory(self):
-        """Populate watched caches so we don't resubmit already recorded history."""
+        """Populate watched caches to prevent duplicate submissions."""
         if self.dry_run:
             logging.info("Dry run enabled. Skipping watched history caching from Trakt.")
             return
@@ -144,53 +178,104 @@ class TraktIO(object):
                 # Cache watched shows/episodes
                 watched_shows = Trakt["sync/watched"].shows()
                 if watched_shows:
-                    for show in watched_shows:
-                        show_name = show.title.lower() if hasattr(show, 'title') else ""
-                        for season in show.seasons:
-                            for episode in season.episodes:
-                                # Cache episodes by both trakt ID and show/season/episode info
-                                self._watched_episodes.add(episode.trakt)
+                    for entry in watched_shows:
+                        # Handle tuple format from trakt.py
+                        if isinstance(entry, tuple) and len(entry) == 2:
+                            show, seasons = entry
+                        else:
+                            show = entry
+                            seasons = getattr(entry, 'seasons', [])
+                        
+                        show_name = getattr(show, 'title', '')
+                        show_name_lower = show_name.lower() if show_name else ""
+                        
+                        for season in seasons:
+                            season_number = getattr(season, 'number', None)
+                            if season_number is None:
+                                continue
+                                
+                            episodes = getattr(season, 'episodes', [])
+                            for episode in episodes:
+                                # Cache episodes by trakt ID
+                                ep_trakt = getattr(episode, 'trakt', None)
+                                if ep_trakt:
+                                    self._watched_episodes.add(ep_trakt)
+                                
                                 # Also cache by show name, season, episode for lookup
-                                episode_key = (show_name, season.number, episode.number)
-                                self._watched_episodes.add(episode_key)
+                                ep_number = getattr(episode, 'number', None)
+                                if show_name_lower and ep_number is not None:
+                                    episode_key = (show_name_lower, season_number, ep_number)
+                                    self._watched_episodes.add(episode_key)
                 
                 # Cache watched movies
                 watched_movies = Trakt["sync/watched"].movies()
                 if watched_movies:
-                    for movie in watched_movies:
-                        if hasattr(movie, 'ids') and hasattr(movie.ids, 'tmdb'):
-                            self._watched_movies.add(movie.ids.tmdb)
+                    for entry in watched_movies:
+                        # Handle tuple format
+                        if isinstance(entry, tuple) and entry:
+                            movie = entry[0]
+                        else:
+                            movie = entry
+                        
+                        # Get TMDB ID from movie
+                        ids = getattr(movie, 'ids', None)
+                        if ids:
+                            tmdb_id = getattr(ids, 'tmdb', None)
+                            if tmdb_id:
+                                self._watched_movies.add(tmdb_id)
+            
+            logging.info(f"Cached {len(self._watched_episodes)} watched episode entries "
+                        f"and {len(self._watched_movies)} watched movies")
                             
         except Exception as e:
-            logging.error(f"⚠ Error caching Trakt history: {e}")
+            logging.error(f"Error caching Trakt history: {e}")
     
     def isWatchedMovie(self, tmdb_id: int) -> bool:
-        """Return True if the TMDB movie ID is already in watched cache."""
+        """Check if a movie with given TMDB ID is already watched."""
         result = tmdb_id in self._watched_movies
         logging.debug(f"isWatchedMovie({tmdb_id}) -> {result}")
         return result
     
     def isEpisodeWatched(self, show_name: str, season_number: int, episode_number: int) -> bool:
-        """Return True if (show, season, episode) tuple is cached as watched."""
+        """
+        Check if an episode is already watched.
+        
+        Args:
+            show_name: Name of the TV show
+            season_number: Season number
+            episode_number: Episode number (can be None)
+            
+        Returns:
+            True if episode is in watched cache, False otherwise
+        """
+        if episode_number is None:
+            logging.debug(f"isEpisodeWatched({show_name}, S{season_number:02d}E??) -> False (episode number unknown)")
+            return False
+        
         episode_key = (show_name.lower(), season_number, episode_number)
         result = episode_key in self._watched_episodes
-        logging.debug(f"isEpisodeWatched({show_name}, S{season_number:02d}E{episode_number:02d}) -> {result}")
+        logging.debug(
+            f"isEpisodeWatched({show_name}, S{season_number:02d}E{episode_number:02d}) -> {result}"
+        )
         return result
     
     def addMovie(self, movie_data: dict):
-        """Queue a movie payload for next sync."""
+        """Add a movie to the pending sync buffer."""
         self._movies.append(movie_data)
     
     def addEpisodeToHistory(self, episode_data: dict):
-        """Queue an episode payload for next sync."""
+        """Add an episode to the pending sync buffer."""
         self._episodes.append(episode_data)
     
     def getData(self) -> dict:
-        """Return queued movie and episode payloads for sync."""
+        """Get pending sync data."""
         return {"movies": self._movies, "episodes": self._episodes}
     
     def sync(self):
-        """Perform sync to Trakt using the library"""
+        """
+        Perform batch sync to Trakt using the trakt.py library.
+        Syncs movies and episodes in configurable batch sizes.
+        """
         if self.dry_run:
             logging.info("Dry run enabled. Skipping actual Trakt sync.")
             return {
@@ -201,76 +286,25 @@ class TraktIO(object):
         
         try:
             with Trakt.configuration.oauth.from_response(self.authorization):
-                # Sync in batches as per your implementation
-                result = {"added": {"movies": 0, "episodes": 0}, 
-                         "not_found": {"movies": [], "episodes": [], "shows": []},
-                         "updated": {"movies": [], "episodes": []}}
-                
-                # Sync movies in batches
+                result = {
+                    "added": {"movies": 0, "episodes": 0},
+                    "not_found": {"movies": [], "episodes": [], "shows": []},
+                    "updated": {"movies": [], "episodes": []},
+                }
+
+                batch_delay = getattr(config, "TRAKT_API_BATCH_DELAY", 1)
+
                 if self._movies:
-                    for i in range(0, len(self._movies), self.page_size):
-                        batch = self._movies[i:i + self.page_size]
-                        response = Trakt["sync/history"].add({"movies": batch})
-                        if response:
-                            result["added"]["movies"] += response.get("added", {}).get("movies", 0)
-                
-                # Sync episodes in batches
+                    result["added"]["movies"] += self._sync_movies_in_batches(result, batch_delay)
                 if self._episodes:
-                    for i in range(0, len(self._episodes), self.page_size):
-                        batch = self._episodes[i:i + self.page_size]
-                        response = Trakt["sync/history"].add({"episodes": batch})
-                        if response:
-                            result["added"]["episodes"] += response.get("added", {}).get("episodes", 0)
-                
+                    result["added"]["episodes"] += self._sync_episodes_in_batches(result, batch_delay)
+
                 logging.debug("Trakt sync response: %s", json.dumps(result, indent=2))
                 return result
                 
         except Exception as e:
-            # Fallback to your direct API approach if library fails
-            logging.warning(f"Library sync failed, using direct API: {e}")
-            return self._sync_direct_api()
-    
-    def _sync_direct_api(self):
-        """Your original direct API sync as fallback"""
-        headers = self._get_auth_headers()
-        payload = json.dumps(self.getData())
-        
-        response = requests.post(
-            "https://api.trakt.tv/sync/history",
-            headers=headers,
-            data=payload,
-            timeout=30,
-        )
-        
-        if response.status_code != 201:
-            raise Exception(
-                f"Trakt sync failed: {response.status_code} - {response.text}"
-            )
-        
-        json_response = response.json()
-        logging.debug("Trakt sync response: %s", json.dumps(json_response, indent=2))
-        
-        # Sanitize response lists (handle APIs that return counts instead of arrays)
-        for key in ["added", "updated", "not_found"]:
-            for subkey in ["movies", "episodes", "shows"]:
-                if key in json_response and subkey in json_response[key]:
-                    val = json_response[key][subkey]
-                    if not isinstance(val, (list, dict)):
-                        json_response[key][subkey] = []
-        
-        return json_response
-    
-    def _get_auth_headers(self):
-        """Return authorization headers for direct API calls."""
-        if not self.authorization:
-            raise Exception("User is not authenticated.")
-        
-        return {
-            "Content-Type": "application/json",
-            "trakt-api-version": "2",
-            "trakt-api-key": config.TRAKT_API_CLIENT_ID,
-            "Authorization": f"Bearer {self.authorization['access_token']}",
-        }
+            logging.error(f"Trakt sync failed: {e}")
+            raise
     
     def authenticate(self):
         """Handle device authentication flow"""
@@ -281,7 +315,7 @@ class TraktIO(object):
         code_info = Trakt["oauth/device"].code()
         
         print(
-            '🔑 Enter the code "%s" at %s to authenticate your Trakt account'
+            'Enter the code "%s" at %s to authenticate your Trakt account'
             % (code_info.get("user_code"), code_info.get("verification_url"))
         )
         
@@ -305,7 +339,7 @@ class TraktIO(object):
     def on_authenticated(self, authorization):
         """Called when user completes authentication successfully"""
         self.authorization = authorization
-        print("✅ Authentication successful!")
+        print("Authentication successful!")
         with open("traktAuth.json", "w") as f:
             json.dump(self.authorization, f)
         self._notify_auth_complete()
@@ -324,3 +358,65 @@ class TraktIO(object):
         self.is_authenticating.acquire()
         self.is_authenticating.notify_all()
         self.is_authenticating.release()
+
+    # --- Internal batch sync helpers ---
+    def _sync_movies_in_batches(self, result: dict, batch_delay: float) -> int:
+        """Sync queued movie history entries in batches. Updates result in-place and returns added count."""
+        added_total = 0
+        total = len(self._movies)
+        logging.info(f"Syncing {total} movies in batches of {self.page_size}")
+        for i in range(0, total, self.page_size):
+            batch = self._movies[i : i + self.page_size]
+            try:
+                response = Trakt["sync/history"].add({"movies": batch})
+                if response:
+                    added = response.get("added", {}).get("movies", 0)
+                    added_total += added
+                    logging.debug(f"Movie batch {i // self.page_size + 1}: Added {added} movies")
+                    if "not_found" in response:
+                        nf_movies = response["not_found"].get("movies", [])
+                        if isinstance(nf_movies, list):
+                            result["not_found"]["movies"].extend(nf_movies)
+                    if "updated" in response:
+                        upd_movies = response["updated"].get("movies", [])
+                        if isinstance(upd_movies, list):
+                            result["updated"]["movies"].extend(upd_movies)
+            except Exception as e:
+                logging.warning(f"Movie batch {i // self.page_size + 1} failed: {e}")
+                continue
+            if i + self.page_size < total:
+                logging.debug(f"Rate limiting: waiting {batch_delay}s between movie batches")
+                time.sleep(batch_delay)
+        return added_total
+
+    def _sync_episodes_in_batches(self, result: dict, batch_delay: float) -> int:
+        """Sync queued episode history entries in batches. Updates result in-place and returns added count."""
+        added_total = 0
+        total = len(self._episodes)
+        logging.info(f"Syncing {total} episodes in batches of {self.page_size}")
+        for i in range(0, total, self.page_size):
+            batch = self._episodes[i : i + self.page_size]
+            try:
+                response = Trakt["sync/history"].add({"episodes": batch})
+                if response:
+                    added = response.get("added", {}).get("episodes", 0)
+                    added_total += added
+                    logging.debug(f"Episode batch {i // self.page_size + 1}: Added {added} episodes")
+                    if "not_found" in response:
+                        nf_eps = response["not_found"].get("episodes", [])
+                        if isinstance(nf_eps, list):
+                            result["not_found"]["episodes"].extend(nf_eps)
+                        nf_shows = response["not_found"].get("shows", [])
+                        if isinstance(nf_shows, list):
+                            result["not_found"]["shows"].extend(nf_shows)
+                    if "updated" in response:
+                        upd_eps = response["updated"].get("episodes", [])
+                        if isinstance(upd_eps, list):
+                            result["updated"]["episodes"].extend(upd_eps)
+            except Exception as e:
+                logging.warning(f"Episode batch {i // self.page_size + 1} failed: {e}")
+                continue
+            if i + self.page_size < total:
+                logging.debug(f"Rate limiting: waiting {batch_delay}s between episode batches")
+                time.sleep(batch_delay)
+        return added_total

@@ -7,3 +7,4 @@ __pycache__
 *.csv
 traktAuth.json
 venv
+tmdb_cache.json

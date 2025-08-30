@@ -8,14 +8,15 @@
 
 This script imports all watched Netflix tv shows and movies to trakt.tv.
 
-It uses TMDB to find the episode number and id of the show/movie by comparing the 
+It uses TMDB to find the episode number and id of the show/movie by comparing the
 episode titles / movie names with the ones from the Netflix export file.
 
 By using TMDB multi-language support is provided!
 
-### Specifics:
+## Specifics
+
 For each entry, the season number and show name is extracted.
-With this information the season is queried from TMDB. 
+With this information the season is queried from TMDB.
 If the episode name from the Netflix Export matches the episode name from the TMDB season, the Id is filled in.
 
 Otherwise, it is checked if the episode number might be already in the title of the episode.
@@ -24,39 +25,44 @@ the script will estimate the episode number based on the viewing history (latest
 
 If no match was found at all, the episode / movie is left out.
 
-## Requirements:
+## Requirements
+
 * Trakt.tv account and API Key
 * TMDB account and API Key
 * Netflix Account
 * Python (tested with python 3.8.5 under macOS)
 
 ## Installation
+
 Just clone this repo, fill in the API keys and language information in the config.py file.
 If your Netflix csv file uses a different datetime format (default: day.month.year) then change the
 `viewing_history_datetime_format` setting in the [`config.ini` file](README.MD#configuration).
-Note: Use %Y for years like 2023 and %y for year entries like 23. 
+Note: Use %Y for years like 2023 and %y for year entries like 23.
 If your csv file uses a different delimiter than `,` between date and entry, then change the
 `viewing_history_delimiter` option as well.
 
 See how to register API access below.
 
 Install the requirements (trakt.tv and tmdb) by calling:
+
 ```bash
 python -m pip install -r requirements.txt
 ```
 
 Also, of course a NetflixViewingHistory.csv export file is needed. This can be obtained directly from the netflix page.
-Compare https://help.netflix.com/node/101917 for more information.
+Compare <https://help.netflix.com/node/101917> for more information.
 
 Note: There is currently no check if the data is already uploaded. This means, if you use the script more than once, make
 sure to delete all previously synced episodes/movies from the csv file.
 
-To use the script simply call 
+To use the script simply call
+
 ```bash
 python netflix2trakt.py
 ```
 
 For printing only the non-found shows just execute
+
 ```bash
 grep "No Tmdb ID found" Netflix2TraktImportLog.log 
 ```
@@ -78,6 +84,7 @@ cp config_default.ini config.ini
 ```
 
 ### Register API Access at Trakt
+
 * Go to "Settings" under your profile
 * Select "Your API Applications"
 * Select "New Application"
@@ -86,7 +93,8 @@ cp config_default.ini config.ini
 * Click "Save App"
 * Make note of your details to be used later.
 
-## Future improvements:
+## Future improvements
+
 * Check found TMDB shows/movies before sending to trakt.tv
 * Better print outputs
 * Use only trakt Search and make TMDB optional
