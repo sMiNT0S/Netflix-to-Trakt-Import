@@ -248,7 +248,7 @@ class NetflixTvHistory(object):
 
     # NEW: Enhanced episode classification methods for fixing misclassified Show: Title entries
     
-    def isLikelyTvShow(self, showName: str, episodeTitle: str) -> bool:
+    def isLikelyTvShow(self, showName: str, episodeTitle: str) -> Optional[bool]:
         """
         Enhanced logic to determine if Show: Title pattern is likely TV episode vs movie.
         
@@ -491,7 +491,7 @@ class NetflixTvShow(object):
         season = self.getSeasonByNumber(effective_season_number)
         if season is not None:
             return season
-        season = self.getSeasonByName(seasonName)
+        season = self.getSeasonByName(seasonName) if seasonName is not None else None
         if season is not None:
             return season
 

@@ -46,6 +46,7 @@ def test_addMovie():
     """Test to add a movie and check if it was recoginzied as a movie"""
     netflixHistory = NetflixTvHistory()
     netflixHistory.addEntry("Spider-Man: Far from Home", "16.09.21")
+    netflixHistory.resolveAmbiguousEntries()  # Resolve ambiguous entries after processing
     assert netflixHistory.getMovie("Spider-Man: Far from Home") is not None
     assert netflixHistory.movies[0].watchedAt[0] == "2021-09-16T20:15:00.00Z"
 
