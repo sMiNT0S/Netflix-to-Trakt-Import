@@ -14,6 +14,16 @@ class NetflixTvHistory(object):
     def __init__(self):
         self.shows = []
         self.movies = []
+        
+        # NEW: Enhanced episode classification system
+        self.known_show_names = set()  # Track confirmed TV show names for context
+        self.ambiguous_entries = []    # Store Show: Title entries for post-processing
+        self.classification_stats = {
+            'episodes_certain': 0,      # Episodes with clear S#E# format
+            'episodes_inferred': 0,     # Episodes classified via context/patterns
+            'movies_certain': 0,        # Clear movie entries
+            'ambiguous_resolved': 0     # Ambiguous entries resolved via context
+        }
 
     def hasTvShow(self, showName: str) -> bool:
         """
@@ -105,7 +115,7 @@ class NetflixTvHistory(object):
             )
             return True
 
-        # Check for TvShow: EpisodeTitle
+        # Check for TvShow: EpisodeTitle (ENHANCED with context awareness)
         # sometimes used in this format for the first season of a show
         # Example: "Wednesday: Leid pro quo","29.11.22"
         # @tricky: Also movies sometimes use this format (e.g "King Arthur: Legend of the Sword","17.01.21")
@@ -113,12 +123,32 @@ class NetflixTvHistory(object):
         res = tvshowregex.search(entryTitle)
         if res is not None:
             showName = res.group(1)
-            seasonNumber = 1
             episodeTitle = res.group(2)
-            self.addTvShowEntry(showName, seasonNumber, episodeTitle, entryDate)
-            # no return here in order to add it also as a movie (as it can have the same format)
+            
+            # NEW: Enhanced classification logic to reduce misclassification
+            classification = self.isLikelyTvShow(showName, episodeTitle)
+            
+            if classification is True:
+                # Confident it's a TV show episode - process as episode only
+                self.addTvShowEntry(showName, 1, episodeTitle, entryDate)
+                logging.debug(f"Episode classification: Classified '{entryTitle}' as TV episode (confident)")
+                return True
+            elif classification is False:
+                # Confident it's a movie - skip to movie processing below
+                logging.debug(f"Episode classification: Classified '{entryTitle}' as movie (confident)")
+                pass  # Continue to movie processing below
+            else:
+                # Uncertain - store for later context-based resolution
+                logging.debug(f"Episode classification: Storing '{entryTitle}' as ambiguous for later resolution")
+                self.ambiguous_entries.append({
+                    'title': entryTitle,
+                    'show_name': showName,
+                    'episode_title': episodeTitle,
+                    'date': entryDate
+                })
+                return True  # Don't process as movie yet - wait for context resolution
 
-        # Else the entry is a movie
+        # Else the entry is a movie (UNCHANGED)
         self.addMovieEntry(entryTitle, entryDate)
         return True
 
@@ -144,10 +174,30 @@ class NetflixTvHistory(object):
         :param seasonName: The name of the season, if it has one
         :type seasonName: Optional[str]
         """
+        # Validate date before creating show/season/episode
+        if not watchedDate or watchedDate.lower() in ("date", "datum"):
+            import logging
+            logging.warning(f"Skipping TV show entry '{showName}' due to invalid date: '{watchedDate}'")
+            return
+            
+        if not any(char.isdigit() for char in watchedDate):
+            import logging
+            logging.warning(f"Skipping TV show entry '{showName}' due to non-date value: '{watchedDate}'")
+            return
+        
         show = self.addTvShow(showName)
         season = show.addSeason(seasonNumber=seasonNumber, seasonName=seasonName)
         episode = season.addEpisode(episodeTitle)
         episode.addWatchedDate(watchedDate)
+        
+        # NEW: Track confirmed show names for enhanced episode classification
+        self.known_show_names.add(showName)
+        
+        # NEW: Update classification statistics
+        if seasonNumber is not None or seasonName is not None:
+            self.classification_stats['episodes_certain'] += 1
+        else:
+            self.classification_stats['episodes_inferred'] += 1
 
     def addTvShow(self, showName):
         """
@@ -171,6 +221,17 @@ class NetflixTvHistory(object):
         :param watchedDate: a string in the format "YYYY-MM-DD" or similar (as given in the config)
         :return: The movie object that was just added to the list of movies.
         """
+        # Validate date before creating movie
+        if not watchedDate or watchedDate.lower() in ("date", "datum"):
+            import logging
+            logging.warning(f"Skipping movie '{movieTitle}' due to invalid date: '{watchedDate}'")
+            return None
+            
+        if not any(char.isdigit() for char in watchedDate):
+            import logging
+            logging.warning(f"Skipping movie '{movieTitle}' due to non-date value: '{watchedDate}'")
+            return None
+        
         movie = self.getMovie(movieTitle)
         if movie is not None:
             movie.addWatchedDate(watchedDate)
@@ -178,8 +239,108 @@ class NetflixTvHistory(object):
         else:
             self.movies.append(NetflixMovie(movieTitle))
             movie = self.movies[-1]
-            movie.addWatchedDate(watchedDate)
+            result = movie.addWatchedDate(watchedDate)
+            # If date parsing failed, remove the movie
+            if result is False:
+                self.movies.pop()
+                return None
             return movie
+
+    # NEW: Enhanced episode classification methods for fixing misclassified Show: Title entries
+    
+    def isLikelyTvShow(self, showName: str, episodeTitle: str) -> bool:
+        """
+        Enhanced logic to determine if Show: Title pattern is likely TV episode vs movie.
+        
+        :param showName: The show name part (before the colon)
+        :param episodeTitle: The episode title part (after the colon)
+        :return: True if likely TV show, False if likely movie, None if uncertain
+        """
+        import re
+        
+        # Check if show name already exists in our confirmed show registry
+        if showName in self.known_show_names:
+            logging.debug(f"Episode classification: Known show detected: {showName}")
+            return True
+        
+        # Check for clear episode indicators in the title
+        episode_patterns = [
+            r'Episode \d+', r'Part \d+', r'Chapter \d+', r'Act \d+',
+            r'Season Finale', r'Pilot', r'Finale', r'Premiere'
+        ]
+        
+        for pattern in episode_patterns:
+            if re.search(pattern, episodeTitle, re.IGNORECASE):
+                logging.debug(f"Episode classification: Episode pattern found in '{episodeTitle}': {pattern}")
+                return True
+        
+        # Check for clear movie indicators (less likely to be episodes)
+        movie_patterns = [
+            r'Legend of', r'Rise of', r'Return of', r'Age of',
+            r'The .+ Movie', r'Director.*Cut', r'Extended Edition',
+            r'Special Edition', r'Uncut', r'Remastered'
+        ]
+        
+        full_title = f"{showName}: {episodeTitle}"
+        for pattern in movie_patterns:
+            if re.search(pattern, full_title, re.IGNORECASE):
+                logging.debug(f"Episode classification: Movie pattern found in '{full_title}': {pattern}")
+                return False
+        
+        # No clear indicators - mark as uncertain for later context-based resolution
+        logging.debug(f"Episode classification: Uncertain classification for '{showName}: {episodeTitle}'")
+        return None  # Explicitly uncertain
+    
+    def resolveAmbiguousEntries(self):
+        """
+        Post-process ambiguous Show: Title entries using accumulated context from known TV shows.
+        This is called after all Netflix entries have been initially parsed.
+        """
+        resolved_count = 0
+        
+        # NEW: Build frequency map of show names from ambiguous entries
+        show_frequencies = {}
+        for entry in self.ambiguous_entries:
+            show_name = entry['show_name']
+            if show_name not in show_frequencies:
+                show_frequencies[show_name] = []
+            show_frequencies[show_name].append(entry)
+        
+        for entry in self.ambiguous_entries:
+            show_name = entry['show_name']
+            
+            # Method 1: Show name was confirmed elsewhere during parsing
+            if show_name in self.known_show_names:
+                logging.info(f"Episode classification: Resolving ambiguous entry as episode (known show): {show_name}")
+                self.addTvShowEntry(
+                    show_name, 1, 
+                    entry['episode_title'], 
+                    entry['date']
+                )
+                self.classification_stats['ambiguous_resolved'] += 1
+                resolved_count += 1
+                
+            # Method 2: Multiple episodes from same show suggest it's a TV series
+            elif len(show_frequencies[show_name]) >= 2:
+                logging.info(f"Episode classification: Resolving ambiguous entry as episode (multiple episodes): {show_name}")
+                self.addTvShowEntry(
+                    show_name, 1, 
+                    entry['episode_title'], 
+                    entry['date']
+                )
+                self.classification_stats['ambiguous_resolved'] += 1
+                resolved_count += 1
+                
+            else:
+                # No additional context found - classify as movie (preserve original behavior)
+                logging.info(f"Episode classification: Resolving ambiguous entry as movie: {entry['title']}")
+                self.addMovieEntry(entry['title'], entry['date'])
+        
+        if resolved_count > 0:
+            logging.info(f"Episode classification: Resolved {resolved_count} ambiguous entries as episodes based on context")
+        
+        # Clear the list after processing
+        self.ambiguous_entries.clear()
 
     def getJson(self) -> dict:
         """
@@ -228,10 +389,17 @@ class NetflixWatchableItem(object):
                 watchedDate + " 20:15", config.CSV_DATETIME_FORMAT + " %H:%M"
             )
         except ValueError:
-            # try the date with a dot (also for backwards compatbility)
-            watchedDate = re.sub("[^0-9]", ".", watchedDate)
-            time = datetime.datetime.strptime(watchedDate + " 20:15", "%m.%d.%y %H:%M")
-        return self._watchedAt.add(time.strftime("%Y-%m-%dT%H:%M:%S.00Z"))
+            try:
+                # try the date with a dot (also for backwards compatbility)
+                watchedDate = re.sub("[^0-9]", ".", watchedDate)
+                time = datetime.datetime.strptime(watchedDate + " 20:15", "%m.%d.%y %H:%M")
+            except ValueError as e:
+                import logging
+                logging.error(f"Failed to parse date '{watchedDate}': {e}")
+                return False
+        formatted_date = time.strftime("%Y-%m-%dT%H:%M:%S.00Z")
+        self._watchedAt.add(formatted_date)
+        return True
 
 
 # The `NetflixMovie` class is a subclass of the `NetflixWatchableItem` class
@@ -307,24 +475,27 @@ class NetflixTvShow(object):
         self.name: str = showName
         self.seasons: list[NetflixTvShowSeason] = []
 
-    def addSeason(self, seasonNumber: int, seasonName: str) -> NetflixTvShowSeason:
+    def addSeason(self, seasonNumber: Union[int, None], seasonName: Optional[str] = None) -> NetflixTvShowSeason:
         """
         If the season doesn't exist, add it to the list of seasons
 
-        :param seasonNumber: The season number of the season
-        :type seasonNumber: int
+        :param seasonNumber: The season number of the season (None defaults to 1)
+        :type seasonNumber: Union[int, None]
         :param seasonName: The name of the season
-        :type seasonName: str
+        :type seasonName: Optional[str]
         :return: The last season added to the list of seasons
         """
-        season = self.getSeasonByNumber(seasonNumber)
+        # Handle None season number (default to 1 for limited series)
+        effective_season_number = seasonNumber if seasonNumber is not None else 1
+        
+        season = self.getSeasonByNumber(effective_season_number)
         if season is not None:
             return season
         season = self.getSeasonByName(seasonName)
         if season is not None:
             return season
 
-        self.seasons.append(NetflixTvShowSeason(seasonNumber, seasonName))
+        self.seasons.append(NetflixTvShowSeason(effective_season_number, seasonName))
         return self.seasons[-1]
 
     def getSeasonByNumber(self, seasonNumber: int) -> Union[NetflixTvShowSeason, None]:
