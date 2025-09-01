@@ -510,7 +510,7 @@ class TraktIO(object):
         stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
         wait=wait_exponential(multiplier=2, min=5, max=60),
         retry=retry_if_exception_type((HTTPError, Exception)),
-        before_sleep=before_sleep_log(logging, logging.WARNING),
+        before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
     )
     def _sync_batch_with_retry(self, data: dict, content_type: str, batch_num: int, batch_delay: float = 3.0):
         """
