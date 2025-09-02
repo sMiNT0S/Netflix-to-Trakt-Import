@@ -18,6 +18,7 @@ from tenacity import retry, stop_after_attempt, wait_random
 from tmdbv3api import TV, Movie, Season, TMDb
 from tmdbv3api.exceptions import TMDbException
 from tqdm import tqdm
+from trakt import Trakt
 
 import config
 from NetflixTvShow import NetflixTvHistory, NetflixMovie, NetflixTvShowEpisode
@@ -264,10 +265,10 @@ def get_title_variations(original_title):
 def get_known_title_mappings():
     """
     Return dictionary of known problematic Netflix->TMDB title mappings.
-    These are common cases where Netflix exports differ from TMDB titles.
+    These are common cases where Netflix format exports differ from TMDB titles.
     """
     return {
-        # Documentary series with missing subtitles
+        # Documentary series with missing sub-titles
         "World War II": "World War II in Colour",
         "American Murder": "American Murder: The Family Next Door", 
         "Into the Fire": "Into the Fire: The Lost Daughter",
@@ -296,6 +297,13 @@ def get_known_title_mappings():
         "La Palma": "La Palma",
         "The Madness": "The Madness",
         "Adolescence": "Adolescence",
+        
+        # Episode-specific titles that need mapping to main series
+        "Fake Profile: Killer Match: The Forbidden Dream": "Fake Profile",
+        "How to Change Your Mind: Limited Series": "How to Change Your Mind",
+        "Cheer: Season 2": "Cheer",
+        "The Innocence Files: Limited Series": "The Innocence Files",
+        "Car Masters: Rust to Riches": "Car Masters: Rust to Riches",  # Already correct
         
         # Add more mappings as patterns are discovered
     }
@@ -578,8 +586,9 @@ def processShow(show, traktIO, tmdb_cache):
                         matched = True
                         break
             
-            # Second try: episode number in title
+            # Second try: episode number in title (including roman numerals)
             if not matched:
+                # Try regular episode numbers first
                 match = re.search(r"(?:Episode|Ep\.?)\s*(\d+)", episode.name, re.IGNORECASE)
                 if match:
                     episode_number = int(match.group(1))
@@ -589,6 +598,41 @@ def processShow(show, traktIO, tmdb_cache):
                                 episode_tmdb_id = tmdb_episode.get("id")
                                 matched = True
                                 break
+                
+                # Try roman numerals (I, II, III, IV, V, etc.) and Part patterns
+                if not matched:
+                    # Extended roman numeral patterns including Part/Episode prefixes
+                    roman_patterns = [
+                        r"\b([IVX]{1,4})\b",  # Standalone roman numerals
+                        r"Part\s+([IVX]{1,4})\b",  # "Part III"
+                        r"Episode\s+([IVX]{1,4})\b",  # "Episode IV"
+                    ]
+                    
+                    for pattern in roman_patterns:
+                        roman_match = re.search(pattern, episode.name, re.IGNORECASE)
+                        if roman_match:
+                            roman_numeral = roman_match.group(1)
+                            # Convert roman to decimal (extended to XXV)
+                            roman_to_decimal = {
+                                'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5,
+                                'VI': 6, 'VII': 7, 'VIII': 8, 'IX': 9, 'X': 10,
+                                'XI': 11, 'XII': 12, 'XIII': 13, 'XIV': 14, 'XV': 15,
+                                'XVI': 16, 'XVII': 17, 'XVIII': 18, 'XIX': 19, 'XX': 20,
+                                'XXI': 21, 'XXII': 22, 'XXIII': 23, 'XXIV': 24, 'XXV': 25
+                            }
+                            if roman_numeral in roman_to_decimal:
+                                episode_number = roman_to_decimal[roman_numeral]
+                                logging.debug(f"Found roman numeral episode: {roman_numeral} -> {episode_number} (pattern: {pattern})")
+                                if season_data and "episodes" in season_data:
+                                    for tmdb_episode in season_data["episodes"]:
+                                        if tmdb_episode.get("episode_number") == episode_number:
+                                            episode_tmdb_id = tmdb_episode.get("id")
+                                            matched = True
+                                            break
+                                if matched:
+                                    break
+                        if matched:
+                            break
             
             # Third try: estimate based on viewing order
             if not matched and season_data and "episodes" in season_data:
@@ -619,7 +663,8 @@ def processShow(show, traktIO, tmdb_cache):
                             "watched_at": watched_at,
                             "ids": {"tmdb": episode_tmdb_id}
                         }
-                        traktIO.addEpisodeToHistory(episode_data)
+                        # Pass show/season/episode info for immediate caching to prevent duplicates
+                        traktIO.addEpisodeToHistory(episode_data, show.name, season.number, episode_number)
                         logging.info(f"Adding episode: {show.name} S{season.number}E{episode_number}")
                     total_episodes_added += 1
             else:
@@ -677,11 +722,53 @@ def syncToTrakt(traktIO, expected_episodes=None):
         if expected_episodes is not None and episode_count != expected_episodes:
             logging.error(f"SYNC QUEUE MISMATCH: Expected {expected_episodes} episodes in sync queue, found {episode_count}")
         
-        print(f"\nSubmitting {movie_count} movies and {episode_count} episodes to Trakt...")
-        print("Note: This may take several minutes due to rate limiting protection...")
+        # Calculate batch information for user display using TraktIO's actual page size
+        batch_size = traktIO.page_size
+        
+        episode_batches = (episode_count + batch_size - 1) // batch_size if episode_count > 0 else 0
+        movie_batches = (movie_count + batch_size - 1) // batch_size if movie_count > 0 else 0
+        total_batches = episode_batches + movie_batches
+        
+        # Enhanced submission message with batch information
+        submission_parts = []
+        if movie_count > 0:
+            if movie_batches == 1:
+                submission_parts.append(f"{movie_count} movies (1 batch)")
+            else:
+                submission_parts.append(f"{movie_count} movies ({movie_batches} batches)")
+        
+        if episode_count > 0:
+            if episode_batches == 1:
+                submission_parts.append(f"{episode_count} episodes (1 batch)")
+            else:
+                submission_parts.append(f"{episode_count} episodes ({episode_batches} batches)")
+        
+        if submission_parts:
+            print(f"\nSubmitting {' and '.join(submission_parts)} to Trakt...")
+            
+            # Estimate time based on batch count and rate limiting
+            estimated_minutes = max(1, total_batches * 0.5)  # Roughly 30 seconds per batch
+            if estimated_minutes < 2:
+                time_estimate = "about 1 minute"
+            elif estimated_minutes < 5:
+                time_estimate = f"about {int(estimated_minutes)} minutes"
+            else:
+                time_estimate = f"approximately {int(estimated_minutes)} minutes"
+            
+            print(f"Note: This may take {time_estimate} due to rate limiting protection...")
+        else:
+            print("\nNo items to submit to Trakt.")
+        
+        # Start timer for completion time tracking
+        import time
+        sync_start_time = time.time()
         
         # Perform the sync
         response = traktIO.sync()
+        
+        # Calculate completion time
+        sync_end_time = time.time()
+        sync_duration = sync_end_time - sync_start_time
         
         if response:
             # Process response with enhanced error handling
@@ -698,11 +785,23 @@ def syncToTrakt(traktIO, expected_episodes=None):
             failed_movies = failed.get("movies", 0)
             failed_episodes = failed.get("episodes", 0)
             
-            skipped_movies = movie_count - added_movies - failed_movies
-            skipped_episodes = episode_count - added_episodes - failed_episodes
+            # Use proper tracking variables instead of API response calculations
+            # skipped_movies = movie_count - added_movies - failed_movies  # OLD: API-based calculation
+            # skipped_episodes = episode_count - added_episodes - failed_episodes  # OLD: API-based calculation
             
-            # Display results
-            print("\nTrakt sync complete!")
+            # Use our actual pre-submission duplicate detection counters
+            skipped_movies = 0  # TODO: Implement movie duplicate detection if needed
+            skipped_episodes = total_episodes_skipped_watched  # Our actual duplicate detection counter
+            
+            # Display results with completion time
+            minutes = int(sync_duration // 60)
+            seconds = int(sync_duration % 60)
+            if minutes > 0:
+                duration_str = f"{minutes}m {seconds}s"
+            else:
+                duration_str = f"{seconds}s"
+            
+            print(f"\n Trakt sync complete! (completed in {duration_str})")
             print(f"Added: {added_movies} movies, {added_episodes} episodes")
             
             if skipped_movies > 0 or skipped_episodes > 0:
@@ -719,7 +818,7 @@ def syncToTrakt(traktIO, expected_episodes=None):
                 if failed_items["movies"]:
                     logging.error(f"Failed movies: {len(failed_items['movies'])} items")
                 
-                print("\n⚠️  Some items failed to sync. You may want to try again later.")
+                print("\n[WARNING] Some items failed to sync. You may want to try again later.")
                 print("   The failed items have been logged for potential retry.")
             
             # Record any Trakt not_found items
@@ -756,11 +855,38 @@ def main():
     setupTMDB()
     tmdb_cache = TMDBHelper()
     
-    # Configure Trakt
-    traktIO = TraktIO(
-        page_size=config.TRAKT_API_SYNC_PAGE_SIZE,
-        dry_run=config.TRAKT_API_DRY_RUN
-    )
+    # Configure Trakt (uses config.ini settings automatically)
+    traktIO = TraktIO()
+    
+    # Enhanced account verification with library stats
+    username = traktIO.verifyAccountInfo()
+    if username:
+        print(f" Connected to Trakt account: {username}")
+        
+        # Get detailed library stats from the verification
+        try:
+            with Trakt.configuration.oauth.from_response(traktIO.authorization):
+                stats = Trakt["users/me/stats"].get()
+                if stats:
+                    print(" Your Trakt Library:")
+                    print(f"   - {stats.shows.watched:,} shows watched")
+                    print(f"   - {stats.episodes.watched:,} episodes watched")
+                    print(f"   - {stats.movies.watched:,} movies watched")
+                    print(f"   - {stats.episodes.plays + stats.movies.plays:,} total plays")
+        except Exception as e:
+            logging.debug(f"Could not fetch detailed stats: {e}")
+    else:
+        print(" Could not verify Trakt account - check authentication")
+    
+    # Enhanced duplicate detection summary
+    cached_episodes = len(traktIO._watched_episodes)
+    cached_movies = len(traktIO._watched_movies)
+    
+    print("\n Duplicate Prevention:")
+    print(f"   - Cached {cached_episodes:,} watched episodes for duplicate detection")
+    print(f"   - Cached {cached_movies:,} watched movies for duplicate detection")
+    print("   - Only new content will be imported to prevent duplicates")
+    print()
     
     # Load Netflix history
     print("Loading Netflix viewing history...")
@@ -792,7 +918,7 @@ def main():
         stats = getattr(netflixHistory, 'classification_stats', {})
         resolved_count = stats.get('ambiguous_resolved', 0)
         if resolved_count > 0:
-            print(f"  ✅ Resolved {resolved_count} ambiguous entries using context analysis")
+            print(f"  [OK] Resolved {resolved_count} ambiguous entries using context analysis")
     
     print(f"Found {len(netflixHistory.shows)} TV shows and {len(netflixHistory.movies)} movies")
     
@@ -845,7 +971,18 @@ def main():
     # Perform the final sync to Trakt
     syncToTrakt(traktIO, total_episodes_added)
     
-    print("\n✅ Processing complete! Check the log file for detailed information.")
+    # Final comprehensive summary for user clarity
+    print("\n" + "="*60)
+    print("IMPORT SUMMARY")
+    print("="*60)
+    print(f"Netflix CSV entries processed: {total_processed_episodes:,} episodes")
+    print(f"Your existing Trakt library: {len(traktIO._watched_episodes):,} episodes")
+    print(f"New episodes imported: {total_episodes_added:,}")
+    print(f"Episodes skipped (duplicates): {total_episodes_skipped_watched:,}")
+    print(f"Episodes skipped (no TMDB match): {total_episodes_skipped_no_tmdb:,}")
+    print("="*60)
+    if total_episodes_skipped_watched > 0:
+        print("\n[OK] Processing complete! Check the log file for detailed information.")
 
 
 if __name__ == "__main__":

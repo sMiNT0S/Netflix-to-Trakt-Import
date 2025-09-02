@@ -258,9 +258,27 @@ class NetflixTvHistory(object):
         """
         import re
         
-        # Check if show name already exists in our confirmed show registry
-        if showName in self.known_show_names:
-            logging.debug(f"Episode classification: Known show detected: {showName}")
+        # Check for known TV show names that are commonly misclassified
+        known_tv_shows = {
+            '100 humans', 'fargo', 'the office', 'stranger things', 'black mirror',
+            'friends', 'the crown', 'narcos', 'house of cards', 'orange is the new black',
+            'the witcher', 'squid game', 'bridgerton', 'ozark', 'money heist',
+            'the umbrella academy', 'elite', 'dark', 'lucifer', 'the good place',
+            'breaking bad', 'better call saul', 'game of thrones', 'westworld',
+            'the mandalorian', 'stranger things', 'the boys', 'euphoria',
+            # Additional commonly misclassified shows
+            'black sails', 'the pacific', 'band of brothers', 'chernobyl',
+            'sherlock', 'peaky blinders', 'true detective', 'fargo', 'mindhunter',
+            'the haunting of hill house', 'the haunting of bly manor', 'ratched',
+            'the queens gambit', 'bridgerton', 'lupin', 'emily in paris',
+            'cobra kai', 'outer banks', 'ginny & georgia', 'shadow and bone',
+            'the irregulars', 'fate the winx saga', 'cursed', 'barbarians',
+            'la brea', 'yellowjackets', 'succession', 'euphoria', 'the bear',
+            'wednesday', 'dahmer', 'monster', 'the watcher', 'ginny and georgia'
+        }
+        
+        if showName.lower() in known_tv_shows:
+            logging.debug(f"Episode classification: Known TV show detected: {showName}")
             return True
         
         # Check for clear episode indicators in the title

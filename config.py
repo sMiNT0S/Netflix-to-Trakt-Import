@@ -42,6 +42,7 @@ if TRAKT_REDIRECT_URI in ("None", ""):
     TRAKT_REDIRECT_URI = None
 
 TRAKT_API_DRY_RUN = _config.getboolean(Section.TRAKT, "dry_run")
+TRAKT_API_VERBOSE = _config.getboolean(Section.TRAKT, "verbose")
 TRAKT_API_SYNC_PAGE_SIZE = _config.getint(Section.TRAKT, "page_size")
 
 # Batch delay to avoid rate limiting (seconds). Use 1.0s default if not provided.
