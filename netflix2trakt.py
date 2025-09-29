@@ -22,7 +22,7 @@ from trakt import Trakt
 
 import config
 from NetflixTvShow import NetflixTvHistory, NetflixMovie, NetflixTvShowEpisode
-from TraktIO import TraktIO
+from TraktIO import TraktIO, _generate_episode_keys, _parse_tmdb_id
 
 # Constants
 EPISODES_AND_MOVIES_NOT_FOUND_FILE = "not_found.csv"
@@ -33,6 +33,63 @@ total_processed_episodes = 0
 total_episodes_added = 0
 total_episodes_skipped_watched = 0
 total_episodes_skipped_no_tmdb = 0
+skipped_preexisting_snapshot = 0
+skipped_within_run_duplicates = 0
+snapshot_tmdb_coverage_percent = 0.0
+
+# Snapshot and queue tracking (populated during runtime)
+start_episode_snapshot = set()
+start_episode_tmdb_snapshot = set()
+start_movie_snapshot = set()
+
+queued_unique_episode_markers = set()
+queued_unique_movie_ids = set()
+queued_movie_play_count = 0
+
+
+def make_episode_unique_marker(show_name, season_number, episode_number, tmdb_id):
+    """
+    Generate a stable unique marker for episode accounting and deduplication.
+
+    This function creates a consistent identifier for episodes that prioritizes
+    TMDB IDs when available but falls back to title-based markers when necessary.
+    The marker format enables separation of TMDB-backed vs uncertain episodes
+    in accounting and reporting.
+
+    Marker selection strategy:
+    1. Primary: TMDB-based marker if tmdb_id is valid integer
+    2. Fallback: Title-based marker using normalized show name
+
+    Args:
+        show_name: Show title (may contain formatting variations)
+        season_number: Season number
+        episode_number: Episode number
+        tmdb_id: TMDB episode ID if available (preferred)
+
+    Returns:
+        Tuple in one of two formats:
+        - ("tmdb", tmdb_id) for TMDB-backed episodes
+        - ("slug", normalized_show, season_number, episode_number) for title-based
+
+    The TMDB-backed format is preferred because:
+    - TMDB IDs are globally unique and stable
+    - Immune to title formatting variations
+    - Provide reliable baseline for snapshot reconciliation
+
+    The title-based fallback handles cases where TMDB matching failed,
+    but still provides reasonable deduplication within the current run.
+    """
+    # Prefer TMDB-based marker for maximum reliability and global uniqueness
+    if tmdb_id:
+        try:
+            return ("tmdb", int(tmdb_id))
+        except (TypeError, ValueError):
+            pass
+
+    # Fallback to title-based marker when TMDB ID unavailable
+    normalized_show = (show_name or "").lower()
+    return ("slug", normalized_show, season_number, episode_number)
+
 
 # TMDB API instances
 tmdb_instance = TMDb()
@@ -169,6 +226,7 @@ class TMDBHelper:
             hit_rate = (self.hits / total) * 100
             logging.info(f"TMDB cache summary: hits={self.hits} misses={self.misses} "
                         f"hit_rate={hit_rate:.1f}% entries={len(self.cache)}")
+
 
 
 def setupTMDB():
@@ -530,11 +588,12 @@ def getMovieInformationFromTMDB(movie_name, tmdb_cache):
         tmdb_cache.set_cached_result(f"movie_{movie_name}", None)
         return None
 
-
 def processShow(show, traktIO, tmdb_cache):
     """Process a TV show and add all its episodes to Trakt"""
     global total_netflix_episodes, total_processed_episodes
     global total_episodes_added, total_episodes_skipped_watched, total_episodes_skipped_no_tmdb
+    global skipped_preexisting_snapshot, skipped_within_run_duplicates
+    global queued_unique_episode_markers
     
     # Count total episodes in this show
     episode_count = sum(len(season.episodes) for season in show.seasons)
@@ -652,12 +711,55 @@ def processShow(show, traktIO, tmdb_cache):
                 if isinstance(episode, NetflixTvShowEpisode):
                     episode.setTmdbId(episode_tmdb_id)
                 
-                # Check if already watched
-                if traktIO.isEpisodeWatched(show.name, season.number, episode_number):
+                # Normalize TMDB ID to integer for consistent duplicate detection
+                tmdb_numeric_id = _parse_tmdb_id(episode_tmdb_id)
+                if tmdb_numeric_id is not None:
+                    episode_tmdb_id = tmdb_numeric_id
+
+                # Generate multiple alias keys for robust duplicate detection
+                # This handles title variations between Netflix exports and Trakt data
+                episode_keys = _generate_episode_keys(show.name, season.number, episode_number)
+
+                # Dual-tier duplicate detection: TMDB-backed (preferred) + alias key fallback
+                # TMDB detection: Check if episode ID exists in baseline snapshot
+                preexisting_by_tmdb = (
+                    tmdb_numeric_id is not None and tmdb_numeric_id in start_episode_tmdb_snapshot
+                )
+                # Alias key detection: Check if any generated key exists in baseline snapshot
+                preexisting_by_key = any(key in start_episode_snapshot for key in episode_keys)
+
+                # Master duplicate check using improved isEpisodeWatched logic
+                # This method implements the two-tier detection internally
+                if traktIO.isEpisodeWatched(show.name, season.number, episode_number, tmdb_numeric_id):
                     logging.info(f"Episode already watched: {show.name} S{season.number}E{episode_number}")
                     total_episodes_skipped_watched += 1
+
+                    # Classify duplicate source for accurate accounting
+                    # Preexisting: Found in baseline snapshot (existing Trakt data)
+                    # Within-run: Duplicate within current CSV processing session
+                    if preexisting_by_tmdb or preexisting_by_key:
+                        skipped_preexisting_snapshot += 1
+                    else:
+                        skipped_within_run_duplicates += 1
                 else:
-                    # Add episode to Trakt queue
+                    # Track unique episodes vs individual plays for accurate accounting
+                    # Only count as new unique episode if not in baseline snapshots
+                    if not preexisting_by_tmdb and not preexisting_by_key:
+                        marker = make_episode_unique_marker(
+                            show.name,
+                            season.number,
+                            episode_number,
+                            tmdb_numeric_id if tmdb_numeric_id is not None else episode_tmdb_id,
+                        )
+                        # Debug log to catch TMDb ID type mismatches
+                        if marker[0] == "tmdb" and marker[1] not in start_episode_tmdb_snapshot:
+                            logging.debug(f"TMDb marker not in baseline: {marker[1]} (type: {type(marker[1])})")
+                        # Track unique episode marker (separates from play count)
+                        queued_unique_episode_markers.add(marker)
+
+                    # Add individual episode plays to Trakt queue
+                    # Key distinction: This counts plays (watch events), not unique episodes
+                    # A single episode may have multiple watch events (rewatches)
                     for watched_at in episode.watchedAt:
                         episode_data = {
                             "watched_at": watched_at,
@@ -666,7 +768,8 @@ def processShow(show, traktIO, tmdb_cache):
                         # Pass show/season/episode info for immediate caching to prevent duplicates
                         traktIO.addEpisodeToHistory(episode_data, show.name, season.number, episode_number)
                         logging.info(f"Adding episode: {show.name} S{season.number}E{episode_number}")
-                    total_episodes_added += 1
+                    # total_episodes_added tracks plays, not unique episodes
+                    total_episodes_added += len(episode.watchedAt)
             else:
                 logging.warning(f"Episode not matched: {show.name} S{season.number} - {episode.name}")
                 total_episodes_skipped_no_tmdb += 1
@@ -675,6 +778,7 @@ def processShow(show, traktIO, tmdb_cache):
 
 def processMovie(movie: NetflixMovie, traktIO, tmdb_cache):
     """Process a movie and add to Trakt if found on TMDB"""
+    global queued_movie_play_count, queued_unique_movie_ids
     # Get movie TMDB ID
     tmdb_id = getMovieInformationFromTMDB(movie.name, tmdb_cache)
     
@@ -686,8 +790,19 @@ def processMovie(movie: NetflixMovie, traktIO, tmdb_cache):
             logging.info(f"Movie already watched: {movie.name}")
             return "skipped"
         
-        # Add movie to Trakt queue
-        for watched_time in movie.watchedAt:
+        # Deduplicate watch times for this movie while preserving play count
+        unique_watch_times = set(movie.watchedAt)
+        # Track total plays across all movies (includes rewatches)
+        queued_movie_play_count += len(unique_watch_times)
+
+        # Track unique movies separately from plays for accurate accounting
+        # Only count as new unique movie if not in baseline snapshot
+        if tmdb_id not in start_movie_snapshot:
+            queued_unique_movie_ids.add(tmdb_id)
+
+        # Add individual movie plays to Trakt queue
+        # Key distinction: Each play is a separate watch event, even for same movie
+        for watched_time in unique_watch_times:
             logging.info(f"Adding movie to trakt: {movie.name}")
             movie_data = {
                 "title": movie.name,
@@ -702,142 +817,133 @@ def processMovie(movie: NetflixMovie, traktIO, tmdb_cache):
         return "not_found"
 
 
-def syncToTrakt(traktIO, expected_episodes=None):
+def syncToTrakt(
+    traktIO,
+    expected_episode_plays=None,
+    unique_episode_count=None,
+    movie_play_count=None,
+    tmdb_marker_count=0,
+    slug_marker_count=0,
+    snapshot_tmdb_coverage=None,
+):
     """
-    Final sync call to Trakt API with comprehensive logging and error handling
+    Final sync call to Trakt API with comprehensive logging and error handling.
+    Reports only server-side outcomes (added, rejected as duplicate, API failures).
+    Local pre-queue skips are computed and printed in main().
+    Safe: getData() is a local buffer; len() here does not hit the network.
     """
-    try:
-        data_to_sync = traktIO.getData()
+    # Snapshot the queue once and reuse
+    data_to_sync = traktIO.getData()
+    episode_count = len(data_to_sync.get("episodes", []))
+    movie_count   = len(data_to_sync.get("movies", []))
+
+    # Defaults: expected plays == what’s in the queue; unique == tmdb+slug markers
+    if expected_episode_plays is None:
+        expected_episode_plays = episode_count
+    if unique_episode_count is None:
+        unique_episode_count = int(tmdb_marker_count or 0) + int(slug_marker_count or 0)
         
-        movie_count = len(data_to_sync.get("movies", []))
-        episode_count = len(data_to_sync.get("episodes", []))
+
+    # Logging + sanity check
+    logging.info("=== FINAL SYNC TO TRAKT ===")
+    logging.info(f"Movies queued for sync: {movie_count}")
+    logging.info(f"Episodes queued for sync: {episode_count}")
+    logging.info(f"Total items queued for sync: {movie_count + episode_count}")
+
+    if snapshot_tmdb_coverage is not None:
+        logging.info(f"Start snapshot TMDb coverage: {snapshot_tmdb_coverage:.1f}%")
+
+    if episode_count != expected_episode_plays:
+        logging.error(
+            f"SYNC QUEUE MISMATCH: Expected {expected_episode_plays} episodes in sync queue, found {episode_count}"
+        )
+
+    # Pretty preamble
+    batch_size = getattr(traktIO, "page_size", 30)
+    ep_batches = (episode_count + batch_size - 1) // batch_size if episode_count else 0
+    mv_batches = (movie_count   + batch_size - 1) // batch_size if movie_count   else 0
+    total_batches = ep_batches + mv_batches
+
+    resolved_movie_play_count = movie_play_count if movie_play_count is not None else movie_count
+
+    parts = []
+    if movie_count:
+        parts.append(f"{resolved_movie_play_count} movie plays")
+    if episode_count:
+        ep_phrase = f"{episode_count} episode plays"
+        if unique_episode_count:
+            ep_phrase += f" (across {unique_episode_count} unique episodes)"
+        parts.append(ep_phrase)
+
+    if parts:
+        print(f"\nSubmitting {' and '.join(parts)} to Trakt...")
+        est_min = max(1, int(total_batches * 0.5))  # ~30s per batch
+        print(f"Note: This may take about {est_min if est_min > 1 else 1} minute{'s' if est_min != 1 else ''} due to rate limiting protection.")
+    else:
+        print("\nNo items to submit to Trakt.")
+
+    # Time the sync
+    import time
+    t0 = time.time()
+    response = traktIO.sync()
+    dt = time.time() - t0
+
+    # Summarize results
+    minutes, seconds = int(dt // 60), int(dt % 60)
+    duration_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+
+    if response:
+        added   = response.get("added",   {})
+        failed  = response.get("failed",  {})
+        raw_m   = added.get("movies",   0)
+        raw_e   = added.get("episodes", 0)
+
+        added_movies    = len(raw_m) if isinstance(raw_m, list) else int(raw_m or 0)
+        added_episodes  = len(raw_e) if isinstance(raw_e, list) else int(raw_e or 0)
+        failed_movies   = int(failed.get("movies",   0) or 0)
+        failed_episodes = int(failed.get("episodes", 0) or 0)
         
-        # Comprehensive logging for the sync phase
-        logging.info("=== FINAL SYNC TO TRAKT ===")
-        logging.info(f"Movies queued for sync: {movie_count}")
-        logging.info(f"Episodes queued for sync: {episode_count}")
-        logging.info(f"Total items queued for sync: {movie_count + episode_count}")
-        
-        # Validate that our queue matches our earlier counts
-        if expected_episodes is not None and episode_count != expected_episodes:
-            logging.error(f"SYNC QUEUE MISMATCH: Expected {expected_episodes} episodes in sync queue, found {episode_count}")
-        
-        # Calculate batch information for user display using TraktIO's actual page size
-        batch_size = traktIO.page_size
-        
-        episode_batches = (episode_count + batch_size - 1) // batch_size if episode_count > 0 else 0
-        movie_batches = (movie_count + batch_size - 1) // batch_size if movie_count > 0 else 0
-        total_batches = episode_batches + movie_batches
-        
-        # Enhanced submission message with batch information
-        submission_parts = []
-        if movie_count > 0:
-            if movie_batches == 1:
-                submission_parts.append(f"{movie_count} movies (1 batch)")
-            else:
-                submission_parts.append(f"{movie_count} movies ({movie_batches} batches)")
-        
-        if episode_count > 0:
-            if episode_batches == 1:
-                submission_parts.append(f"{episode_count} episodes (1 batch)")
-            else:
-                submission_parts.append(f"{episode_count} episodes ({episode_batches} batches)")
-        
-        if submission_parts:
-            print(f"\nSubmitting {' and '.join(submission_parts)} to Trakt...")
-            
-            # Estimate time based on batch count and rate limiting
-            estimated_minutes = max(1, total_batches * 0.5)  # Roughly 30 seconds per batch
-            if estimated_minutes < 2:
-                time_estimate = "about 1 minute"
-            elif estimated_minutes < 5:
-                time_estimate = f"about {int(estimated_minutes)} minutes"
-            else:
-                time_estimate = f"approximately {int(estimated_minutes)} minutes"
-            
-            print(f"Note: This may take {time_estimate} due to rate limiting protection...")
-        else:
-            print("\nNo items to submit to Trakt.")
-        
-        # Start timer for completion time tracking
-        import time
-        sync_start_time = time.time()
-        
-        # Perform the sync
-        response = traktIO.sync()
-        
-        # Calculate completion time
-        sync_end_time = time.time()
-        sync_duration = sync_end_time - sync_start_time
-        
-        if response:
-            # Process response with enhanced error handling
-            added = response.get("added", {})
-            failed = response.get("failed", {})
-            
-            # Handle both integer and list response formats
-            raw_movies = added.get("movies", 0)
-            raw_episodes = added.get("episodes", 0)
-            
-            added_movies = len(raw_movies) if isinstance(raw_movies, list) else int(raw_movies)
-            added_episodes = len(raw_episodes) if isinstance(raw_episodes, list) else int(raw_episodes)
-            
-            failed_movies = failed.get("movies", 0)
-            failed_episodes = failed.get("episodes", 0)
-            
-            # Use proper tracking variables instead of API response calculations
-            # skipped_movies = movie_count - added_movies - failed_movies  # OLD: API-based calculation
-            # skipped_episodes = episode_count - added_episodes - failed_episodes  # OLD: API-based calculation
-            
-            # Use our actual pre-submission duplicate detection counters
-            skipped_movies = 0  # TODO: Implement movie duplicate detection if needed
-            skipped_episodes = total_episodes_skipped_watched  # Our actual duplicate detection counter
-            
-            # Display results with completion time
-            minutes = int(sync_duration // 60)
-            seconds = int(sync_duration % 60)
-            if minutes > 0:
-                duration_str = f"{minutes}m {seconds}s"
-            else:
-                duration_str = f"{seconds}s"
-            
-            print(f"\n Trakt sync complete! (completed in {duration_str})")
-            print(f"Added: {added_movies} movies, {added_episodes} episodes")
-            
-            if skipped_movies > 0 or skipped_episodes > 0:
-                print(f"Skipped (already watched): {skipped_movies} movies, {skipped_episodes} episodes")
-            
-            if failed_movies > 0 or failed_episodes > 0:
-                print(f"FAILED (API errors): {failed_movies} movies, {failed_episodes} episodes")
-                print("Check the log file for details on failed items.")
-                
-                # Check for failed items
-                failed_items = traktIO.get_failed_items()
-                if failed_items["episodes"]:
-                    logging.error(f"Failed episodes: {len(failed_items['episodes'])} items")
-                if failed_items["movies"]:
-                    logging.error(f"Failed movies: {len(failed_items['movies'])} items")
-                
-                print("\n[WARNING] Some items failed to sync. You may want to try again later.")
-                print("   The failed items have been logged for potential retry.")
-            
-            # Record any Trakt not_found items
-            nf = response.get("not_found", {})
-            if isinstance(nf, dict):
-                for m in nf.get("movies", []) or []:
-                    title = m.get("title") if isinstance(m, dict) else None
-                    append_not_found(title or "UNKNOWN_MOVIE")
-                for s in nf.get("shows", []) or []:
-                    title = s.get("title") if isinstance(s, dict) else None
-                    append_not_found(title or "UNKNOWN_SHOW")
-    
-    except Exception as e:
-        print(f"Trakt sync failed with exception: {e}")
-        logging.error(f"Trakt sync failed with exception: {e}", exc_info=True)
+        # Pre-submission duplicate detection counters exist elsewhere:
+        #   - Episodes: "skipped locally (already in start snapshot)" and
+        #               "skipped locally (duplicate within this CSV run)".
+        #   - Movies:   analogous local skip counters in main().
+        # In this function we report server-side results only:
+        #   duplicates rejected by Trakt during the sync (API-grounded),
+        #   and API failures. Local skips are printed earlier.
+
+        skipped_movies_by_trakt   = max(0, movie_count   - added_movies   - failed_movies)
+        skipped_episodes_by_trakt = max(0, episode_count - added_episodes - failed_episodes)
+
+        print(f"\n Trakt sync complete! (completed in {duration_str})")
+        print(f"Added: {added_movies} movies, {added_episodes} episodes")
+        if skipped_movies_by_trakt or skipped_episodes_by_trakt:
+            print(f"Skipped by Trakt (duplicates): {skipped_movies_by_trakt} movies, {skipped_episodes_by_trakt} episodes")
+        if failed_movies or failed_episodes:
+            print(f"FAILED (API errors): {failed_movies} movies, {failed_episodes} episodes")
+            print("Check the log file for details on failed items.")
+    else:
+        print("\n Sync failed — see log for details. Counts above reflect queued items only.")
+
+    return response
 
 
 def main():
     """Entry point: loads config, parses history, syncs Trakt"""
+    global total_netflix_episodes, total_processed_episodes
+    global total_episodes_added, total_episodes_skipped_watched, total_episodes_skipped_no_tmdb
+    global skipped_preexisting_snapshot, skipped_within_run_duplicates
+    global start_episode_snapshot, start_episode_tmdb_snapshot, start_movie_snapshot
+    global queued_unique_episode_markers, queued_unique_movie_ids, queued_movie_play_count
+    global snapshot_tmdb_coverage_percent
+    
+    # Reset global counters for clean re-runs within same interpreter
+    total_netflix_episodes = 0
+    total_processed_episodes = 0
+    total_episodes_added = 0
+    total_episodes_skipped_watched = 0
+    total_episodes_skipped_no_tmdb = 0
+    skipped_preexisting_snapshot = 0
+    skipped_within_run_duplicates = 0
     
     # Initialize not_found.csv file
     with open(EPISODES_AND_MOVIES_NOT_FOUND_FILE, "w", newline="", encoding="utf-8") as f:
@@ -858,6 +964,92 @@ def main():
     # Configure Trakt (uses config.ini settings automatically)
     traktIO = TraktIO()
     
+    # Snapshot starting counts (don't let them grow mid-run)
+    start_episode_snapshot = set(traktIO._watched_episodes)
+
+    def _norm_title(t: str) -> str:
+        """
+        Normalize title strings for deduplicating alias keys in episode accounting.
+
+        This function implements the key normalization strategy used to collapse
+        multiple alias keys back to a single canonical representation for
+        accurate unique episode counting.
+
+        Normalization process:
+        1. Convert to lowercase for case-insensitive comparison
+        2. Remove subtitle text after first colon (handles "Show: Season X" patterns)
+        3. Replace all non-alphanumeric characters with spaces
+        4. Strip leading/trailing whitespace
+
+        Args:
+            t: Title string to normalize (may be None)
+
+        Returns:
+            Normalized title string suitable for deduplication
+
+        Example transformations:
+            "The Show: Special Edition" -> "the show"
+            "Action-Adventure: Part II" -> "action adventure"
+            "Documentary (2023)" -> "documentary 2023"
+
+        This normalization ensures that different alias keys generated by
+        _generate_episode_keys() for the same show collapse to a single
+        canonical form when counting unique episodes, preventing double-counting
+        in statistical reporting.
+        """
+        import re
+        t = (t or "").lower()
+        t = re.sub(r":.*$", "", t)                 # drop text after colon
+        t = re.sub(r"[^a-z0-9]+", " ", t).strip()  # alnum normalize
+        return t
+
+    # collapse alias/base/normalized keys back to a single canonical key per episode
+    start_episode_unique = {
+        (_norm_title(k[0]), k[1], k[2])
+        for k in start_episode_snapshot
+        if isinstance(k, tuple) and len(k) == 3
+    }
+
+    # prefer a true number if stats API succeeded, otherwise fall back to our deduped estimate
+    initial_watched_eps = (
+        len(start_episode_unique)
+    )
+
+    start_episode_tmdb_snapshot = set(traktIO._watched_episode_tmdb_ids)
+
+    start_movie_snapshot = set(traktIO._watched_movies)
+    queued_unique_episode_markers = set()
+    queued_unique_movie_ids = set()
+    queued_movie_play_count = 0
+
+    initial_watched_movies = len(start_movie_snapshot)
+
+    print(f"Starting unique episodes in Trakt (snapshot): {initial_watched_eps:,}")
+    print(f"(Internal cache keys for dup-detection: {len(start_episode_snapshot):,})")
+    # Snapshot reconciliation: prefer TMDB-backed baseline when name-key baseline is empty
+    # This handles scenarios where sync/watched returns limited data but sync/history has TMDB IDs
+    if initial_watched_eps == 0 and len(start_episode_tmdb_snapshot) > 0:
+        print(f"(TMDb-backed baseline: {len(start_episode_tmdb_snapshot):,} unique episodes seeded from history)")
+    print(f"Starting movies in Trakt (snapshot): {initial_watched_movies:,}")
+
+    # Coverage calculation with special handling for 0% scenarios
+    # Prevents misleading percentage displays when baseline is empty
+    if initial_watched_eps == 0:
+        snapshot_tmdb_coverage_percent = 0.0
+        print(f"Start snapshot coverage: {len(start_episode_tmdb_snapshot):,} TMDB IDs over 0 unique episodes (n/a)")
+        if len(start_episode_tmdb_snapshot) > 0:
+            # Key insight: TMDB baseline exists despite 0 name-key baseline
+            # This indicates sync/watched returned minimal data but history hydration succeeded
+            print("  Note: TMDB IDs seeded from history; Trakt's watched snapshot returned 0 episodes this run.")
+    else:
+        # Standard coverage calculation when name-key baseline exists
+        snapshot_tmdb_coverage_percent = (len(start_episode_tmdb_snapshot) / initial_watched_eps) * 100.0
+        print(f"Start snapshot coverage: {len(start_episode_tmdb_snapshot):,} TMDB IDs "
+              f"over {initial_watched_eps:,} unique episodes ({snapshot_tmdb_coverage_percent:.1f}% TMDB coverage)")
+    starting_unique_episodes_stat = None
+    starting_movies_stat = None
+    starting_shows_stat = None
+    starting_total_plays_stat = None
     # Enhanced account verification with library stats
     username = traktIO.verifyAccountInfo()
     if username:
@@ -868,23 +1060,29 @@ def main():
             with Trakt.configuration.oauth.from_response(traktIO.authorization):
                 stats = Trakt["users/me/stats"].get()
                 if stats:
+                    starting_shows_stat = stats.shows.watched
+                    starting_unique_episodes_stat = stats.episodes.watched
+                    starting_movies_stat = stats.movies.watched
+                    starting_total_plays_stat = stats.episodes.plays + stats.movies.plays
                     print(" Your Trakt Library:")
-                    print(f"   - {stats.shows.watched:,} shows watched")
-                    print(f"   - {stats.episodes.watched:,} episodes watched")
-                    print(f"   - {stats.movies.watched:,} movies watched")
-                    print(f"   - {stats.episodes.plays + stats.movies.plays:,} total plays")
+                    print(f"   - {starting_shows_stat:,} shows watched")
+                    print(f"   - {starting_unique_episodes_stat:,} episodes watched")
+                    print(f"   - {starting_movies_stat:,} movies watched")
+                    print(f"   - {starting_total_plays_stat:,} total plays")
         except Exception as e:
             logging.debug(f"Could not fetch detailed stats: {e}")
     else:
         print(" Could not verify Trakt account - check authentication")
     
     # Enhanced duplicate detection summary
-    cached_episodes = len(traktIO._watched_episodes)
-    cached_movies = len(traktIO._watched_movies)
-    
+    initial_watched_movies = len(traktIO._watched_movies)
+
     print("\n Duplicate Prevention:")
-    print(f"   - Cached {cached_episodes:,} watched episodes for duplicate detection")
-    print(f"   - Cached {cached_movies:,} watched movies for duplicate detection")
+    if initial_watched_eps > 0:
+        print(f"   - Cached {initial_watched_eps:,} watched episodes (name-key) for duplicate detection")
+    else:
+        print(f"   - Cached {len(start_episode_tmdb_snapshot):,} watched episodes (TMDb baseline) for duplicate detection")
+    print(f"   - Cached {initial_watched_movies:,} watched movies for duplicate detection")
     print("   - Only new content will be imported to prevent duplicates")
     print()
     
@@ -909,18 +1107,62 @@ def main():
                 
                 netflixHistory.addEntry(title, date)
     
-    # NEW: Post-processing - resolve ambiguous entries with context
+    # Post-processing - resolve ambiguous entries with context
     if hasattr(netflixHistory, 'ambiguous_entries') and netflixHistory.ambiguous_entries:
-        print(f"Resolving {len(netflixHistory.ambiguous_entries)} ambiguous entries with context...")
+        # Determinism: sort ambiguous entries so resolution order is stable and testable
+        try:
+            def _amb_key(entry):
+                # Prefer dictionary access for deterministic ordering
+                if isinstance(entry, dict):
+                    name = (entry.get('show_name') or entry.get('title') or entry.get('name') or '')
+                    date = entry.get('date') or entry.get('watchedAt') or entry.get('watched_at') or ''
+                else:
+                    name = (
+                        getattr(entry, 'show_name', None)
+                        or getattr(entry, 'title', None)
+                        or getattr(entry, 'name', None)
+                        or str(entry)
+                    )
+                    date = (
+                        getattr(entry, 'date', None)
+                        or getattr(entry, 'watchedAt', None)
+                        or getattr(entry, 'watched_at', None)
+                        or ''
+                    )
+                return (str(name).lower(), str(date))
+            netflixHistory.ambiguous_entries.sort(key=_amb_key)
+        except Exception as sort_err:
+            # Best-effort; keep going if structure is unexpected
+            logging.debug(f"Ambiguous entry sort skipped due to structure: {sort_err}")
+
+        initial_ambiguous_total = len(netflixHistory.ambiguous_entries)
+        print(f"Resolving {initial_ambiguous_total} ambiguous entries with context...")
         netflixHistory.resolveAmbiguousEntries()
         
         # Log the classification results
-        stats = getattr(netflixHistory, 'classification_stats', {})
-        resolved_count = stats.get('ambiguous_resolved', 0)
-        if resolved_count > 0:
-            print(f"  [OK] Resolved {resolved_count} ambiguous entries using context analysis")
-    
-    print(f"Found {len(netflixHistory.shows)} TV shows and {len(netflixHistory.movies)} movies")
+        stats = getattr(netflixHistory, 'classification_stats', {}) or {}
+        amb_resolved = int(stats.get('ambiguous_resolved', 0) or 0)
+        amb_defaulted = int(
+            stats.get('ambiguous_defaulted', max(0, initial_ambiguous_total - amb_resolved)) or 0
+        )
+        stats['ambiguous_total'] = initial_ambiguous_total
+        stats['ambiguous_defaulted'] = amb_defaulted
+        try:
+            setattr(netflixHistory, 'classification_stats', stats)
+        except Exception as store_err:
+            logging.debug(
+                f"Could not persist ambiguous classification stats: {store_err}"
+            )
+
+        print(
+            f"  [OK] Ambiguous: {stats['ambiguous_total']}, resolved as episodes: {amb_resolved}, "
+            f"defaulted to movies: {amb_defaulted}"
+        )
+
+        print(
+            f"Inventory after resolution: {len(netflixHistory.shows)} TV shows, "
+            f"{len(netflixHistory.movies)} movies"
+        )
     
     # Initialize tracking for movies
     movies_added = 0
@@ -957,32 +1199,173 @@ def main():
     logging.info(f"Total episodes from Netflix: {total_netflix_episodes}")
     logging.info(f"Episodes after TMDB processing: {total_processed_episodes}")
     logging.info(f"Episodes queued for Trakt sync: {total_episodes_added}")
-    logging.info(f"Episodes skipped (already watched): {total_episodes_skipped_watched}")
+    logging.info(
+        f"Episodes skipped (already watched snapshot): {skipped_preexisting_snapshot}"
+    )
+    logging.info(
+        f"Episodes skipped (duplicate within run): {skipped_within_run_duplicates}"
+    )
     logging.info(f"Episodes skipped (no TMDB ID): {total_episodes_skipped_no_tmdb}")
     
-    # Verify our accounting adds up
-    accounted_total = total_episodes_added + total_episodes_skipped_watched + total_episodes_skipped_no_tmdb
-    if accounted_total != total_processed_episodes:
-        logging.error(f"ACCOUNTING ERROR: Processed {total_processed_episodes} episodes but only accounted for {accounted_total}")
+    # Verify our accounting adds up (all buckets cover distinct episodes)
+    accounted_total_episodes = (
+        len(queued_unique_episode_markers)
+        + skipped_preexisting_snapshot
+        + skipped_within_run_duplicates
+        + total_episodes_skipped_no_tmdb
+    )
+    if accounted_total_episodes != total_processed_episodes:
+        logging.error(
+            "ACCOUNTING ERROR: Processed %s episodes but only accounted for %s",
+            total_processed_episodes,
+            accounted_total_episodes,
+        )
     
     # Log TMDB cache efficiency summary before final sync
     tmdb_cache.log_summary()
-    
+
+    tmdb_marker_count = sum(
+        1
+        for marker in queued_unique_episode_markers
+        if isinstance(marker, tuple) and marker and marker[0] == "tmdb"
+    )
+    slug_marker_count = max(0, len(queued_unique_episode_markers) - tmdb_marker_count)
+    print(
+        f"Unique-episode markers: {tmdb_marker_count:,} TMDB-backed, {slug_marker_count:,} title-derived"
+    )
+    if initial_watched_eps == 0 and len(start_episode_tmdb_snapshot) > 0:
+        # we have a TMDb baseline; use it
+        print(f"Expected unique new episodes from queue: {tmdb_marker_count:,} (TMDb-backed)")
+    elif initial_watched_eps == 0:
+        # truly no baseline at all
+        print("Expected unique new episodes: unknown (no baseline)")
+    else:
+        print(f"Expected unique new episodes from queue: {tmdb_marker_count:,} (TMDb-backed)")
+
     # Perform the final sync to Trakt
-    syncToTrakt(traktIO, total_episodes_added)
+    resp = syncToTrakt(
+        traktIO,
+        expected_episode_plays=total_episodes_added,
+        movie_play_count=queued_movie_play_count,
+        tmdb_marker_count=tmdb_marker_count,
+        slug_marker_count=slug_marker_count,
+        snapshot_tmdb_coverage=snapshot_tmdb_coverage_percent,
+    )
+    # Use API grounded numbers for summary (fallback to precomputed on failure)
+    queued_episode_plays_actual = len(traktIO.getData().get("episodes", []))
+    queued_movie_plays_actual = len(traktIO.getData().get("movies", []))
+    queued_unique_episode_count = tmdb_marker_count + slug_marker_count
+    queued_unique_movie_count = len(queued_unique_movie_ids)
+
+    added_movies = 0
+    added_episodes = total_episodes_added
+    failed_movies = 0
+    failed_episodes = 0
+    duplicate_episode_plays_trakt = 0
+    duplicate_movie_plays_trakt = 0
+    if resp:
+        added = resp.get("added", {})
+        failed = resp.get("failed", {})
+        raw_movies = added.get("movies", 0)
+        raw_episodes = added.get("episodes", 0)
+        added_movies = len(raw_movies) if isinstance(raw_movies, list) else int(raw_movies or 0)
+        added_episodes = len(raw_episodes) if isinstance(raw_episodes, list) else int(raw_episodes or 0)
+        failed_movies = int(failed.get("movies", 0) or 0)
+        failed_episodes = int(failed.get("episodes", 0) or 0)
+        duplicate_episode_plays_trakt = max(0, queued_episode_plays_actual - added_episodes - failed_episodes)
+        duplicate_movie_plays_trakt = max(0, queued_movie_plays_actual - added_movies - failed_movies)
     
-    # Final comprehensive summary for user clarity
-    print("\n" + "="*60)
-    print("IMPORT SUMMARY")
-    print("="*60)
-    print(f"Netflix CSV entries processed: {total_processed_episodes:,} episodes")
-    print(f"Your existing Trakt library: {len(traktIO._watched_episodes):,} episodes")
-    print(f"New episodes imported: {total_episodes_added:,}")
-    print(f"Episodes skipped (duplicates): {total_episodes_skipped_watched:,}")
-    print(f"Episodes skipped (no TMDB match): {total_episodes_skipped_no_tmdb:,}")
-    print("="*60)
-    if total_episodes_skipped_watched > 0:
-        print("\n[OK] Processing complete! Check the log file for detailed information.")
+    print("\nQueue overview")
+    print(f"  Netflix CSV episode entries processed: {total_processed_episodes:,}")
+
+    # Critical distinction: Plays vs Unique Items
+    # Plays = individual watch events (includes rewatches of same episode/movie)
+    # Unique items = distinct episodes/movies (deduplicated count)
+    episode_queue_line = f"  Episode plays queued: {queued_episode_plays_actual:,}"
+    if queued_unique_episode_count:
+        episode_queue_line += (
+            f" across {tmdb_marker_count:,} unique new episodes (TMDB-backed)"
+        )
+        if slug_marker_count:
+            episode_queue_line += (
+                f" + {slug_marker_count:,} uncertain (title-derived only)"
+            )
+    print(episode_queue_line)
+
+    # Movies follow same plays vs unique items distinction
+    movie_queue_line = f"  Movie plays queued:   {queued_movie_plays_actual:,}"
+    if queued_unique_movie_count:
+        movie_queue_line += f" across {queued_unique_movie_count:,} unique movies"
+    print(movie_queue_line)
+    
+    print("\nTrakt response")
+    if resp:
+        print(f"  Added: {added_episodes:,} episode plays, {added_movies:,} movie plays")
+        print(
+            f"  Rejected by Trakt as duplicate plays: {duplicate_episode_plays_trakt:,} episodes, "
+            f"{duplicate_movie_plays_trakt:,} movies"
+        )
+        print(
+            f"  API errors: {failed_episodes:,} episode plays, {failed_movies:,} movie plays"
+        )
+    else:
+        print("  Sync failed - see log for details. Counts above reflect queued items only.")
+    
+    print("\nLocal filters (pre-queue)")
+    print(
+        f"  Episodes skipped locally (already in start snapshot): {skipped_preexisting_snapshot:,}"
+    )
+    print(
+        f"  Episodes skipped locally (duplicate within this CSV run): {skipped_within_run_duplicates:,}"
+    )
+    print(f"  Episodes skipped (no TMDB match): {total_episodes_skipped_no_tmdb:,}")
+    print(f"  Movies skipped locally (already watched): {movies_skipped:,}")
+    print(f"  Movies skipped (no TMDB match): {movies_not_found:,}")
+    
+    # Snapshot reconciliation: intelligently choose baseline for post-sync calculations
+    # Prefer name-key baseline when available, fall back to TMDB-backed baseline
+    # This ensures accurate accounting even when sync/watched returns incomplete data
+    effective_unique_eps_baseline = (
+        initial_watched_eps if initial_watched_eps > 0 else len(start_episode_tmdb_snapshot)
+    )
+
+    print("\nSnapshot reconciliation (unique items)")
+    print(f"  Starting unique episodes (snapshot): {initial_watched_eps:,}")
+    if starting_unique_episodes_stat is not None:
+        print(f"  Starting unique episodes (Trakt stats API): {starting_unique_episodes_stat:,}")
+
+    # Indicate when TMDB-backed reconciliation is being used
+    # This happens when sync/watched failed but history hydration provided TMDB baseline
+    if initial_watched_eps == 0 and len(start_episode_tmdb_snapshot) > 0:
+        print("  (Reconciling using TMDb-backed baseline this run)")
+
+    # Report expected new episodes based on available baseline
+    # Only TMDB-backed markers are counted as reliable for unique episode estimates
+    if (initial_watched_eps > 0) or (len(start_episode_tmdb_snapshot) > 0):
+        print(f"  Expected new episodes from queue: {tmdb_marker_count:,} (TMDb-backed)")
+    else:
+        print("  Expected new episodes from queue: unknown (no baseline)")
+
+    # Calculate expected post-sync total using effective baseline
+    # This provides accurate expectations regardless of which baseline was used
+    print(f"  Expected post-sync unique episodes: {effective_unique_eps_baseline + tmdb_marker_count:,}")
+    print(f"  Starting movies (snapshot): {initial_watched_movies:,}")
+    if starting_movies_stat is not None:
+        print(f"  Starting movies (Trakt stats API): {starting_movies_stat:,}")
+    print(f"  Expected new movies from queue: {queued_unique_movie_count:,}")
+    print(
+        f"  Expected post-sync movie total: {initial_watched_movies + queued_unique_movie_count:,}"
+    )
+    if starting_shows_stat is not None:
+        print(f"  Starting shows (Trakt stats API): {starting_shows_stat:,}")
+    if starting_total_plays_stat is not None:
+        print(f"  Starting total plays (Trakt stats API): {starting_total_plays_stat:,}")
+    print("  (Verify updated totals on trakt.tv to confirm expectations.)")
+    
+    if resp:
+        print("\n[OK] Processing complete. Review the log for detailed entries if needed.")
+    else:
+        print("\n[WARNING] Processing aborted during sync. Investigate the log before rerunning.")
 
 
 if __name__ == "__main__":

@@ -315,6 +315,7 @@ class NetflixTvHistory(object):
         This is called after all Netflix entries have been initially parsed.
         """
         resolved_count = 0
+        total_ambiguous = len(self.ambiguous_entries)
         
         # NEW: Build frequency map of show names from ambiguous entries
         show_frequencies = {}
@@ -356,6 +357,10 @@ class NetflixTvHistory(object):
         
         if resolved_count > 0:
             logging.info(f"Episode classification: Resolved {resolved_count} ambiguous entries as episodes based on context")
+        
+        # Persist aggregate stats for external consumers
+        self.classification_stats['ambiguous_total'] = total_ambiguous
+        self.classification_stats['ambiguous_defaulted'] = max(0, total_ambiguous - resolved_count)
         
         # Clear the list after processing
         self.ambiguous_entries.clear()
