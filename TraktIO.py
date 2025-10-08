@@ -149,6 +149,8 @@ class TraktIO(object):
         # Track consecutive authentication failures for fail-fast
         self._consecutive_auth_failures = 0
         self._max_auth_failures = 3  # Fail fast after 3 consecutive auth issues
+        self._last_account_check_status: Optional[str] = None
+        self._last_watched_fetch_status: Optional[str] = None
 
         self.is_authenticating = Condition()
 
@@ -205,14 +207,21 @@ class TraktIO(object):
                     # This context manager sets up the token for the library
                     pass
 
-            if self.getWatchedShows() is not None:
+            watched_shows = self.getWatchedShows()
+            if watched_shows is not None:
                 self._user_message("Authorization appears valid. Watched shows retrieved.", "info")
                 self.cacheWatchedHistory()
             else:
-                self._user_message(
-                    "No watched shows found. Token validation passed but empty response received. For new accounts this is expected. For existing accounts with history, consider token refresh or re-authentication.",
-                    "warning"
-                )
+                if self._last_watched_fetch_status == "server_error":
+                    self._user_message(
+                        "Trakt watch history temporarily unavailable (server error). Proceeding with fresh cache; retries will hydrate once the service recovers.",
+                        "warning",
+                    )
+                else:
+                    self._user_message(
+                        "No watched shows found. Token validation passed but empty response received. For new accounts this is expected. For existing accounts with history, consider token refresh or re-authentication.",
+                        "warning"
+                    )
                 # Explicitly clear caches for fresh environment
                 self._watched_episodes.clear()
                 self._watched_movies.clear()
@@ -437,6 +446,7 @@ class TraktIO(object):
 
     def verifyAccountInfo(self):
         """Debug method to verify which account we're accessing and get basic stats"""
+        self._last_account_check_status = "unknown"
         try:
             with Trakt.configuration.oauth.from_response(self.authorization):
                 # Get user info
@@ -464,21 +474,45 @@ class TraktIO(object):
                     except Exception as stats_error:
                         logging.debug(f"Stats API call failed (non-critical): {stats_error}")
                     
+                    self._last_account_check_status = "ok"
                     return user.username
                 else:
                     logging.debug("Could not retrieve user information")
+                    self._last_account_check_status = "no_data"
                     return None
+        except HTTPError as e:
+            status_code = getattr(e.response, "status_code", None)
+            if status_code and 500 <= status_code < 600:
+                logging.warning(f"Trakt status check unavailable (server error {status_code})")
+                self._last_account_check_status = "server_error"
+                return None
+            logging.error(f"Error verifying account info: {e}")
+            self._last_account_check_status = "client_error"
+            return None
         except Exception as e:
             logging.error(f"Error verifying account info: {e}")
+            self._last_account_check_status = "exception"
             return None
 
     def getWatchedShows(self):
         """Retrieve all watched TV shows from Trakt with full episode data"""
         try:
             with Trakt.configuration.oauth.from_response(self.authorization):
-                return Trakt["sync/watched"].shows()
+                shows = Trakt["sync/watched"].shows()
+                self._last_watched_fetch_status = "ok"
+                return shows
+        except HTTPError as e:
+            status_code = getattr(e.response, "status_code", None)
+            if status_code and 500 <= status_code < 600:
+                logging.warning(f"Trakt watched-shows endpoint unavailable (server error {status_code})")
+                self._last_watched_fetch_status = "server_error"
+            else:
+                logging.error(f"Error getting watched shows: {e}")
+                self._last_watched_fetch_status = "client_error"
+            return None
         except Exception as e:
             logging.error(f"Error getting watched shows: {e}")
+            self._last_watched_fetch_status = "exception"
             return None
 
     def getWatchedMovies(self):
@@ -873,7 +907,10 @@ class TraktIO(object):
                 logging.warning(
                     f"Batch {batch_num}: Received None response from Trakt API"
                 )
-                self._user_message(f"Batch {batch_num}: No response from Trakt API (possible token issue)", "warning")
+                self._user_message(
+                    f"Batch {batch_num}: No response from Trakt API - will retry shortly.",
+                    "warning",
+                )
                 raise Exception("No response from Trakt API")
 
             return response
@@ -886,14 +923,19 @@ class TraktIO(object):
                 "unable to refresh expired token" in error_str or
                 "token refreshing hasn't been enabled" in error_str):
                 self._consecutive_auth_failures += 1
-                self._user_message(f"Authentication issue detected in batch {batch_num} (failure #{self._consecutive_auth_failures})", "warning")
+                self._user_message(
+                    f"Trakt returned no response for batch {batch_num}; retrying (attempt #{self._consecutive_auth_failures}).",
+                    "warning",
+                )
                 
                 if self._consecutive_auth_failures >= self._max_auth_failures:
-                    self._user_message(f"CRITICAL: {self._consecutive_auth_failures} consecutive authentication failures.", "critical")
+                    self._user_message(f"CRITICAL: {self._consecutive_auth_failures} consecutive sync failures.", "critical")
                     self._user_message("Likely fix: Delete 'traktAuth.json' and re-run the script.", "critical")
                     self._user_message("Stopping sync to prevent further data loss...", "critical")
-                    raise Exception(f"Authentication failed {self._consecutive_auth_failures} times consecutively. " +
-                                   "Please delete 'traktAuth.json' and re-authenticate.")
+                    raise Exception(
+                        f"Authentication failed {self._consecutive_auth_failures} times consecutively. "
+                        "Please delete 'traktAuth.json' and re-authenticate."
+                    )
 
             # Track and handle rate limits
             if "429" in str(e) or "rate" in error_str:

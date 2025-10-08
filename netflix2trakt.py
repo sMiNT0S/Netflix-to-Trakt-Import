@@ -320,53 +320,6 @@ def get_title_variations(original_title):
     return unique_variations
 
 
-def get_known_title_mappings():
-    """
-    Return dictionary of known problematic Netflix->TMDB title mappings.
-    These are common cases where Netflix format exports differ from TMDB titles.
-    """
-    return {
-        # Documentary series with missing sub-titles
-        "World War II": "World War II in Colour",
-        "American Murder": "American Murder: The Family Next Door", 
-        "Into the Fire": "Into the Fire: The Lost Daughter",
-        "Night Stalker": "Night Stalker: The Hunt for a Serial Killer",
-        "Sins of Our Mother": "Sins of Our Mother",
-        
-        # Limited series and HBO content
-        "The Pacific": "The Pacific",  # HBO series
-        "Baby Reindeer": "Baby Reindeer",
-        "Bodies": "Bodies",
-        "Unbelievable": "Unbelievable", 
-        "One Day": "One Day",
-        "The Playlist": "The Playlist",
-        "Griselda": "Griselda",
-        "Eric": "Eric",
-        
-        # True crime and documentaries
-        "Gone Girls": "Gone Girl",  # Alternative title
-        "The Man with 1000 Kids": "The Man with 1000 Kids",
-        "Dancing for the Devil": "Dancing for the Devil: The 7M TikTok Cult",
-        "A Nearly Normal Family": "A Nearly Normal Family",
-        "Dear Child": "Dear Child",
-        "American Nightmare": "American Nightmare",
-        
-        # Common alternative titles
-        "La Palma": "La Palma",
-        "The Madness": "The Madness",
-        "Adolescence": "Adolescence",
-        
-        # Episode-specific titles that need mapping to main series
-        "Fake Profile: Killer Match: The Forbidden Dream": "Fake Profile",
-        "How to Change Your Mind: Limited Series": "How to Change Your Mind",
-        "Cheer: Season 2": "Cheer",
-        "The Innocence Files: Limited Series": "The Innocence Files",
-        "Car Masters: Rust to Riches": "Car Masters: Rust to Riches",  # Already correct
-        
-        # Add more mappings as patterns are discovered
-    }
-
-
 def enhanced_show_search(show_name, tv_api):
     """
     Enhanced TMDB show search with multiple fallback strategies.
@@ -383,20 +336,7 @@ def enhanced_show_search(show_name, tv_api):
     except Exception as e:
         search_attempts.append(f"exact_search_failed: {e}")
     
-    # Strategy 2: Try known mappings
-    mappings = get_known_title_mappings()
-    if show_name in mappings:
-        mapped_title = mappings[show_name]
-        try:
-            results = tv_api.search(mapped_title)
-            if results:
-                tmdb_id = results[0].id if hasattr(results[0], 'id') else results[0].get('id')
-                logging.info(f"TMDB Enhanced: Found '{show_name}' using mapping -> '{mapped_title}' (ID: {tmdb_id})")
-                return tmdb_id, "known_mapping"
-        except Exception as e:
-            search_attempts.append(f"mapped_search_failed: {e}")
-    
-    # Strategy 3: Try title variations
+    # Strategy 2: Try title variations
     variations = get_title_variations(show_name)
     for i, variation in enumerate(variations[1:], 1):  # Skip original (already tried)
         try:
@@ -511,6 +451,38 @@ def getSeasonInformationFromTMDB(show_tmdb_id, season_number, tmdb_cache):
         return None
 
 
+def find_episode_across_seasons(show_tmdb_id, episode_name, tmdb_cache, exclude_season=None, max_seasons=20):
+    """
+    Search across multiple seasons for an episode title when the initial season lookup fails.
+
+    Args:
+        show_tmdb_id: TMDB ID of the show.
+        episode_name: Episode title to search for.
+        tmdb_cache: Cache helper to reuse season lookups.
+        exclude_season: Optional season number to skip (already checked).
+        max_seasons: Upper bound for season numbers to inspect.
+
+    Returns:
+        Tuple of (season_number, episode_dict, season_data) if found, otherwise (None, None, None).
+    """
+    if not episode_name:
+        return None, None, None
+
+    for season_number in range(1, max_seasons + 1):
+        if exclude_season is not None and season_number == exclude_season:
+            continue
+
+        season_data = getSeasonInformationFromTMDB(show_tmdb_id, season_number, tmdb_cache)
+        if not season_data or "episodes" not in season_data:
+            continue
+
+        for tmdb_episode in season_data["episodes"]:
+            if tmdb_episode.get("name") == episode_name:
+                return season_number, tmdb_episode, season_data
+
+    return None, None, None
+
+
 def enhanced_movie_search(movie_name, movie_api):
     """
     Enhanced TMDB movie search with multiple fallback strategies.
@@ -614,22 +586,18 @@ def processShow(show, traktIO, tmdb_cache):
     # Process each season
     for season in show.seasons:
         season_data = getSeasonInformationFromTMDB(show_tmdb_id, season.number, tmdb_cache)
-        
         if season_data is None:
             season_info = f"S{season.number}"
             if season.name:
                 season_info += f" ({season.name})"
-            logging.warning(f"Season not found on TMDB: {show.name} {season_info}")
-            episode_count = len(season.episodes)
-            total_episodes_skipped_no_tmdb += episode_count
-            total_processed_episodes += episode_count
-            for episode in season.episodes:
-                append_not_found(show.name, season.number, episode.name)
-            continue
+            logging.info(
+                f"Season not found on TMDB: {show.name} {season_info} — attempting cross-season fallback for episodes"
+            )
         
         # Process each episode in the season
         for episode in season.episodes:
             total_processed_episodes += 1
+            target_season_number = season.number
             
             # Try to match episode
             matched = False
@@ -704,6 +672,24 @@ def processShow(show, traktIO, tmdb_cache):
                         episode_number = episode_index + 1
                         episode_tmdb_id = season_data["episodes"][episode_index].get("id")
                         matched = True
+
+            # Cross-season fallback if still not matched
+            if not matched and show_tmdb_id is not None:
+                fallback_season_number, fallback_episode, _ = find_episode_across_seasons(
+                    show_tmdb_id,
+                    episode.name,
+                    tmdb_cache,
+                    exclude_season=season.number
+                )
+                if fallback_episode:
+                    episode_number = fallback_episode.get("episode_number")
+                    episode_tmdb_id = fallback_episode.get("id")
+                    if episode_number is not None and episode_tmdb_id is not None:
+                        target_season_number = fallback_season_number if fallback_season_number is not None else target_season_number
+                        matched = True
+                        logging.info(
+                            f"Episode fallback: Found '{episode.name}' under season {target_season_number} via cross-season search"
+                        )
             
             # Add to Trakt if matched
             if matched and episode_tmdb_id:
@@ -718,7 +704,7 @@ def processShow(show, traktIO, tmdb_cache):
 
                 # Generate multiple alias keys for robust duplicate detection
                 # This handles title variations between Netflix exports and Trakt data
-                episode_keys = _generate_episode_keys(show.name, season.number, episode_number)
+                episode_keys = _generate_episode_keys(show.name, target_season_number, episode_number)
 
                 # Dual-tier duplicate detection: TMDB-backed (preferred) + alias key fallback
                 # TMDB detection: Check if episode ID exists in baseline snapshot
@@ -730,8 +716,8 @@ def processShow(show, traktIO, tmdb_cache):
 
                 # Master duplicate check using improved isEpisodeWatched logic
                 # This method implements the two-tier detection internally
-                if traktIO.isEpisodeWatched(show.name, season.number, episode_number, tmdb_numeric_id):
-                    logging.info(f"Episode already watched: {show.name} S{season.number}E{episode_number}")
+                if traktIO.isEpisodeWatched(show.name, target_season_number, episode_number, tmdb_numeric_id):
+                    logging.info(f"Episode already watched: {show.name} S{target_season_number}E{episode_number}")
                     total_episodes_skipped_watched += 1
 
                     # Classify duplicate source for accurate accounting
@@ -747,7 +733,7 @@ def processShow(show, traktIO, tmdb_cache):
                     if not preexisting_by_tmdb and not preexisting_by_key:
                         marker = make_episode_unique_marker(
                             show.name,
-                            season.number,
+                            target_season_number,
                             episode_number,
                             tmdb_numeric_id if tmdb_numeric_id is not None else episode_tmdb_id,
                         )
@@ -766,14 +752,14 @@ def processShow(show, traktIO, tmdb_cache):
                             "ids": {"tmdb": episode_tmdb_id}
                         }
                         # Pass show/season/episode info for immediate caching to prevent duplicates
-                        traktIO.addEpisodeToHistory(episode_data, show.name, season.number, episode_number)
-                        logging.info(f"Adding episode: {show.name} S{season.number}E{episode_number}")
+                        traktIO.addEpisodeToHistory(episode_data, show.name, target_season_number, episode_number)
+                        logging.info(f"Adding episode: {show.name} S{target_season_number}E{episode_number}")
                     # total_episodes_added tracks plays, not unique episodes
                     total_episodes_added += len(episode.watchedAt)
             else:
-                logging.warning(f"Episode not matched: {show.name} S{season.number} - {episode.name}")
+                logging.warning(f"Episode not matched: {show.name} S{target_season_number} - {episode.name}")
                 total_episodes_skipped_no_tmdb += 1
-                append_not_found(show.name, season.number, episode.name)
+                append_not_found(show.name, target_season_number, episode.name)
 
 
 def processMovie(movie: NetflixMovie, traktIO, tmdb_cache):
@@ -1052,6 +1038,7 @@ def main():
     starting_total_plays_stat = None
     # Enhanced account verification with library stats
     username = traktIO.verifyAccountInfo()
+    account_check_status = getattr(traktIO, "_last_account_check_status", None)
     if username:
         print(f" Connected to Trakt account: {username}")
         
@@ -1071,6 +1058,14 @@ def main():
                     print(f"   - {starting_total_plays_stat:,} total plays")
         except Exception as e:
             logging.debug(f"Could not fetch detailed stats: {e}")
+    elif account_check_status == "server_error":
+        print(" Trakt status check temporarily unavailable (server error); continuing without account summary.")
+    elif account_check_status == "no_data":
+        watch_status = getattr(traktIO, "_last_watched_fetch_status", None)
+        if watch_status == "server_error":
+            print(" Trakt user profile not returned (API returned a server error earlier); continuing without account summary.")
+        else:
+            print(" Trakt user profile not returned (account may be empty or private); continuing without account summary.")
     else:
         print(" Could not verify Trakt account - check authentication")
     
